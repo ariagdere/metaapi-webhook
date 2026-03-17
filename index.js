@@ -62,10 +62,18 @@ async function initConnection() {
         });
 
         console.log('Webhook gönderildi:', response.status);
+
       } catch (err) {
         console.error('Webhook hatası:', err.message);
       }
-    }
+    },
+
+    // 🔥 CRASH FIX (zorunlu boş listenerlar)
+    async onSymbolSpecificationUpdated() {},
+    async onSymbolPriceUpdated() {},
+    async onAccountInformationUpdated() {},
+    async onPositionsReplaced() {},
+    async onOrdersReplaced() {}
   });
 
   await connection.connect();
@@ -79,13 +87,13 @@ async function start() {
     try {
       await initConnection();
 
-      // connection canlı kalsın diye sleep
+      // connection açık kalsın
       await new Promise(resolve => setTimeout(resolve, 60000));
 
     } catch (err) {
       console.error('Hata:', err.message);
 
-      // 🔥 önemli: connection reset
+      // reset (subscription leak engeller)
       connection = null;
       isReady = false;
 
