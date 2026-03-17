@@ -6,20 +6,19 @@ const webhookUrl = process.env.WEBHOOK_URL;
 
 const api = new MetaApi(token, { region: 'london' });
 
-let connection = null;
-let isReady = false;
-
-// 🔥 MAGIC: eksik methodları otomatik yutar
+// 🔥 eksik listener methodlarını otomatik handle eder
 function createSafeListener(handler) {
   return new Proxy(handler, {
     get(target, prop) {
       if (prop in target) return target[prop];
-      return async () => {}; // no-op
+      return async () => {};
     }
   });
 }
 
 async function start() {
+  console.log('Başlatılıyor...');
+
   const account = await api.metatraderAccountApi.getAccount(accountId);
 
   if (account.state !== 'DEPLOYED') {
@@ -27,18 +26,12 @@ async function start() {
   }
 
   await account.waitConnected();
+  console.log('MT5 connected');
 
-  connection = account.getStreamingConnection();
+  const connection = account.getStreamingConnection();
 
   const listener = createSafeListener({
-    async onSynchronized() {
-      console.log('Hazır. Deal dinleniyor...');
-      isReady = true;
-    },
-
     async onDealAdded(instanceIndex, deal) {
-      if (!isReady) return;
-
       try {
         const entryType =
           deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
@@ -67,7 +60,7 @@ async function start() {
         });
 
       } catch (err) {
-        console.error(err.message);
+        console.error('Webhook error:', err.message);
       }
     }
   });
@@ -75,14 +68,8 @@ async function start() {
   connection.addSynchronizationListener(listener);
 
   await connection.connect();
-while (!isReady) {
-  console.log('sync bekleniyor...');
-  await new Promise(r => setTimeout(r, 1000));
-}
-setInterval(() => {
-  const state = connection.terminalState;
-  console.log('positions:', state.positions.length);
-}, 5000);
+
+  console.log('🚀 Hazır. Trade bekleniyor...');
 }
 
 start();
