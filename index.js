@@ -6,50 +6,41 @@ const webhookUrl = process.env.WEBHOOK_URL;
 
 async function run() {
   console.log('MetaAPI Webhook Listener başlatılıyor...');
-
+  
   const api = new MetaApi(token);
+  
   const account = await api.metatraderAccountApi.getAccount(accountId);
-
+  
   if (account.state !== 'DEPLOYED') {
     await account.deploy();
   }
-
+  
   await account.waitConnected();
   console.log('MT5 hesabına bağlandı');
 
   const connection = account.getRPCConnection();
   await connection.connect();
-
-  let isReady = false; // 🔑 Kilit flag
+  await connection.waitSynchronized();
+  console.log('Senkronizasyon tamamlandı, trade dinleniyor...');
 
   connection.addSynchronizationListener({
-    // Senkronizasyon bitince flag'i aç
-    async onSynchronized(instanceIndex) {
-      console.log('Senkronizasyon tamamlandı, yeni trade\'ler dinleniyor...');
-      isReady = true;
-    },
-
     async onDealAdded(instanceIndex, deal) {
-      // Senkronizasyon bitmeden gelen (geçmiş) deal'leri atla
-      if (!isReady) return;
-
       try {
         const entryType = deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
         const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
 
-const payload = {
-  event: entryType,
-  symbol: deal.symbol,
-  direction: direction,
-  price: deal.price,
-  volume: deal.volume,
-  profit: deal.profit || 0,
-  dealId: deal.id,           // bu deal'in kendi ID'si
-  positionId: deal.positionId, // 🔑 OPEN ve CLOSE'u birbirine bağlar
-  time: deal.time
-};
+        const payload = {
+          event: entryType,
+          symbol: deal.symbol,
+          direction: direction,
+          price: deal.price,
+          volume: deal.volume,
+          profit: deal.profit || 0,
+          ticket: deal.id,
+          time: deal.time
+        };
 
-        console.log('Yeni deal tespit edildi:', payload);
+        console.log('Deal tespit edildi:', payload);
 
         const response = await fetch(webhookUrl, {
           method: 'POST',
@@ -63,10 +54,9 @@ const payload = {
       }
     }
   });
-
-  await connection.waitSynchronized(); // Flag açılana kadar burada bekle
 }
 
+// Bağlantı kopunca yeniden bağlan
 async function startWithRetry() {
   while (true) {
     try {
