@@ -6,7 +6,10 @@ const webhookUrl = process.env.WEBHOOK_URL;
 
 const api = new MetaApi(token, { region: 'london' });
 
-// 🔥 eksik listener methodlarını otomatik handle eder
+// sadece yeni trade'leri almak için
+const startTime = new Date();
+
+// crash olmaması için safe listener
 function createSafeListener(handler) {
   return new Proxy(handler, {
     get(target, prop) {
@@ -32,33 +35,30 @@ async function start() {
 
   const listener = createSafeListener({
     async onDealAdded(instanceIndex, deal) {
+
+      // 🔥 SADECE YENİ TRADE
+      if (new Date(deal.time) < startTime) return;
+
+      const payload = {
+        event: deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE',
+        symbol: deal.symbol,
+        direction: deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL',
+        price: deal.price,
+        volume: deal.volume,
+        profit: deal.profit || 0,
+        dealId: deal.id,
+        positionId: deal.positionId,
+        time: deal.time
+      };
+
+      console.log('Yeni deal:', payload);
+
       try {
-        const entryType =
-          deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
-
-        const direction =
-          deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
-
-        const payload = {
-          event: entryType,
-          symbol: deal.symbol,
-          direction,
-          price: deal.price,
-          volume: deal.volume,
-          profit: deal.profit || 0,
-          dealId: deal.id,
-          positionId: deal.positionId,
-          time: deal.time
-        };
-
-        console.log('Yeni deal:', payload);
-
         await fetch(webhookUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-
       } catch (err) {
         console.error('Webhook error:', err.message);
       }
@@ -69,7 +69,7 @@ async function start() {
 
   await connection.connect();
 
-  console.log('🚀 Hazır. Trade bekleniyor...');
+  console.log('🚀 Hazır. Sadece yeni trade’ler gönderilecek.');
 }
 
 start();
