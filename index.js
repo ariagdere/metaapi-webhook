@@ -42,7 +42,8 @@ class TradeListener extends SynchronizationListener {
         price: deal.price,
         volume: deal.volume,
         profit: deal.profit || 0,
-        ticket: deal.id,
+        deal_id: deal.id,
+        position_id: deal.positionId,
         time: deal.time
       };
 
