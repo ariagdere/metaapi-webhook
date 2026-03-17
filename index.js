@@ -6,14 +6,10 @@ const webhookUrl = process.env.WEBHOOK_URL;
 
 const api = new MetaApi(token, { region: 'london' });
 
-// sadece yeni event'ler
 const startTime = new Date();
-
-// duplicate engelle
 const seenDeals = new Set();
 const seenOrders = new Set();
 
-// crash engelle
 function createSafeListener(handler) {
   return new Proxy(handler, {
     get(target, prop) {
@@ -39,7 +35,7 @@ async function start() {
 
   const listener = createSafeListener({
 
-    // ✅ DEAL (gerçekleşmiş işlem)
+    // ✅ DEAL (çalışıyordu zaten)
     async onDealAdded(instanceIndex, deal) {
 
       if (new Date(deal.time) < startTime) return;
@@ -69,35 +65,37 @@ async function start() {
       });
     },
 
-    // ✅ ORDER (pending emir)
-    async onOrderUpdated(instanceIndex, order) {
+    // 🔥 ORDER (BU DEĞİŞTİ → artık buradan geliyor)
+    async onOrdersReplaced(instanceIndex, orders) {
 
-      if (!order.time) return;
-      if (new Date(order.time) < startTime) return;
-      if (seenOrders.has(order.id)) return;
-      seenOrders.add(order.id);
+      for (const order of orders) {
 
-      // sadece yeni eklenen order
-      if (order.state !== 'ORDER_STATE_PLACED') return;
+        if (!order.time) continue;
+        if (new Date(order.time) < startTime) continue;
+        if (seenOrders.has(order.id)) continue;
+        seenOrders.add(order.id);
 
-      const payload = {
-        type: 'ORDER',
-        event: 'PLACED',
-        symbol: order.symbol,
-        orderType: order.type,
-        volume: order.volume,
-        price: order.openPrice,
-        orderId: order.id,
-        time: order.time
-      };
+        if (order.state !== 'ORDER_STATE_PLACED') continue;
 
-      console.log('ORDER:', payload);
+        const payload = {
+          type: 'ORDER',
+          event: 'PLACED',
+          symbol: order.symbol,
+          orderType: order.type,
+          volume: order.volume,
+          price: order.openPrice,
+          orderId: order.id,
+          time: order.time
+        };
 
-      await fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+        console.log('ORDER:', payload);
+
+        await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+      }
     }
 
   });
@@ -106,7 +104,7 @@ async function start() {
 
   await connection.connect();
 
-  console.log('🚀 Hazır. DEAL + ORDER dinleniyor...');
+  console.log('🚀 Hazır. DEAL + ORDER aktif.');
 }
 
 start();
