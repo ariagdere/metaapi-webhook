@@ -1,94 +1,70 @@
 const MetaApi = require('metaapi.cloud-sdk').default;
-const { SynchronizationListener } = require('metaapi.cloud-sdk');
 
 const token = process.env.METAAPI_TOKEN;
 const accountId = process.env.METAAPI_ACCOUNT_ID;
 const webhookUrl = process.env.WEBHOOK_URL;
-
-class TradeListener extends SynchronizationListener {
-  constructor() {
-    super();
-    this.synchronized = false;
-    this.startTime = new Date();
-  }
-
-  async onSynchronized() {
-    this.synchronized = true;
-    console.log('Senkronizasyon tamamlandı, trade dinleniyor...');
-  }
-
-  async onConnected() {
-    console.log('Bağlantı kuruldu');
-  }
-
-  async onDisconnected() {
-    console.log('Bağlantı koptu');
-  }
-
-  async onDealAdded(instanceIndex, deal) {
-    if (!this.synchronized) return;
-
-    const dealTime = new Date(deal.time);
-    if (dealTime < this.startTime) return;
-
-    try {
-      const entryType = deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
-      const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
-
-      const payload = {
-        event: entryType,
-        symbol: deal.symbol,
-        direction: direction,
-        price: deal.price,
-        volume: deal.volume,
-        profit: deal.profit || 0,
-        deal_id: deal.id,
-        position_id: deal.positionId,
-        time: deal.time
-      };
-
-      console.log('Yeni deal tespit edildi:', JSON.stringify(payload));
-
-      const response = await fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      console.log('Webhook gönderildi, status:', response.status);
-    } catch (err) {
-      console.error('Webhook hatası:', err.message);
-    }
-  }
-}
 
 async function run() {
   console.log('MetaAPI Webhook Listener başlatılıyor...');
 
   const api = new MetaApi(token);
   const account = await api.metatraderAccountApi.getAccount(accountId);
-  console.log('Hesap durumu:', account.state);
 
   if (account.state !== 'DEPLOYED') {
-    console.log('Hesap deploy ediliyor...');
     await account.deploy();
   }
 
   await account.waitConnected();
   console.log('MT5 hesabına bağlandı');
 
-  const connection = account.getStreamingConnection();
-  const listener = new TradeListener();
-  connection.addSynchronizationListener(listener);
-
-  console.log('Streaming bağlantısı kuruluyor...');
+  const connection = account.getRPCConnection();
   await connection.connect();
-  
-  console.log('Senkronizasyon bekleniyor...');
-  await connection.waitSynchronized({ timeoutInSeconds: 60 });
 
-  console.log('Hazır, trade dinleniyor...');
-  await new Promise(() => {});
+  let isReady = false; // 🔑 Kilit flag
+
+  connection.addSynchronizationListener({
+    // Senkronizasyon bitince flag'i aç
+    async onSynchronized(instanceIndex) {
+      console.log('Senkronizasyon tamamlandı, yeni trade\'ler dinleniyor...');
+      isReady = true;
+    },
+
+    async onDealAdded(instanceIndex, deal) {
+      // Senkronizasyon bitmeden gelen (geçmiş) deal'leri atla
+      if (!isReady) return;
+
+      try {
+        const entryType = deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
+        const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
+
+const payload = {
+  event: entryType,
+  symbol: deal.symbol,
+  direction: direction,
+  price: deal.price,
+  volume: deal.volume,
+  profit: deal.profit || 0,
+  dealId: deal.id,           // bu deal'in kendi ID'si
+  positionId: deal.positionId, // 🔑 OPEN ve CLOSE'u birbirine bağlar
+  time: deal.time
+};
+
+        console.log('Yeni deal tespit edildi:', payload);
+
+        const response = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        console.log('Webhook gönderildi, status:', response.status);
+      } catch (err) {
+        console.error('Webhook hatası:', err.message);
+      }
+    }
+  });
+
+  await connection.waitSynchronized(); // Flag açılana kadar burada bekle
 }
 
 async function startWithRetry() {
@@ -96,7 +72,7 @@ async function startWithRetry() {
     try {
       await run();
     } catch (err) {
-      console.error('Hata:', err.message, '— 10 saniye sonra yeniden bağlanılacak');
+      console.error('Hata, 10 saniye sonra yeniden bağlanılacak:', err.message);
       await new Promise(resolve => setTimeout(resolve, 10000));
     }
   }
