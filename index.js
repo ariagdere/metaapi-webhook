@@ -6,41 +6,51 @@ const webhookUrl = process.env.WEBHOOK_URL;
 
 async function run() {
   console.log('MetaAPI Webhook Listener başlatılıyor...');
-  
-  const api = new MetaApi(token);
-  
+
+  const api = new MetaApi(token, {
+    region: 'london'  // ✅ Hesap region'ı
+  });
+
   const account = await api.metatraderAccountApi.getAccount(accountId);
-  
+
   if (account.state !== 'DEPLOYED') {
     await account.deploy();
   }
-  
+
   await account.waitConnected();
   console.log('MT5 hesabına bağlandı');
 
   const connection = account.getRPCConnection();
   await connection.connect();
-  await connection.waitSynchronized();
-  console.log('Senkronizasyon tamamlandı, trade dinleniyor...');
+
+  let isReady = false;
 
   connection.addSynchronizationListener({
+    async onSynchronized(instanceIndex) {
+      console.log('Senkronizasyon tamamlandı, yeni trade\'ler dinleniyor...');
+      isReady = true;
+    },
+
     async onDealAdded(instanceIndex, deal) {
+      if (!isReady) return;
+
       try {
         const entryType = deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
         const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
 
-        const payload = {
-          event: entryType,
-          symbol: deal.symbol,
-          direction: direction,
-          price: deal.price,
-          volume: deal.volume,
-          profit: deal.profit || 0,
-          ticket: deal.id,
-          time: deal.time
-        };
+const payload = {
+  event: entryType,
+  symbol: deal.symbol,
+  direction: direction,
+  price: deal.price,
+  volume: deal.volume,
+  profit: deal.profit || 0,
+  dealId: deal.id,           // bu deal'in kendi ID'si
+  positionId: deal.positionId, // 🔑 OPEN ve CLOSE'u birbirine bağlar
+  time: deal.time
+};
 
-        console.log('Deal tespit edildi:', payload);
+        console.log('Yeni deal tespit edildi:', payload);
 
         const response = await fetch(webhookUrl, {
           method: 'POST',
@@ -54,9 +64,10 @@ async function run() {
       }
     }
   });
+
+  await connection.waitSynchronized();
 }
 
-// Bağlantı kopunca yeniden bağlan
 async function startWithRetry() {
   while (true) {
     try {
