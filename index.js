@@ -21,6 +21,18 @@ function createSafeListener(handler) {
   });
 }
 
+// 🔥 RR hesap
+function calculateRR(entry, sl, tp) {
+  if (!entry || !sl || !tp) return null;
+
+  const risk = Math.abs(entry - sl);
+  const reward = Math.abs(tp - entry);
+
+  if (risk === 0) return null;
+
+  return (reward / risk).toFixed(2);
+}
+
 async function start() {
   const account = await api.metatraderAccountApi.getAccount(accountId);
 
@@ -32,7 +44,6 @@ async function start() {
 
   const connection = account.getStreamingConnection();
 
-  // ✅ DEAL (tek gerçek execution)
   const listener = createSafeListener({
     async onDealAdded(instanceIndex, deal) {
 
@@ -57,7 +68,7 @@ async function start() {
   connection.addSynchronizationListener(listener);
   await connection.connect();
 
-  console.log('🚀 CLEAN MODE ACTIVE');
+  console.log('🚀 RR MODE ACTIVE');
 
   setInterval(async () => {
 
@@ -68,8 +79,9 @@ async function start() {
     for (const o of orders) {
       const prev = prevOrders.get(o.id);
 
+      const rr = calculateRR(o.openPrice, o.stopLoss, o.takeProfit);
+
       if (!prev) {
-        // CREATED
         await send({
           type: 'ORDER',
           event: 'CREATED',
@@ -79,10 +91,10 @@ async function start() {
           price: o.openPrice,
           sl: o.stopLoss,
           tp: o.takeProfit,
+          rr,
           time: o.time
         });
       } else if (JSON.stringify(prev) !== JSON.stringify(o)) {
-        // UPDATED
         await send({
           type: 'ORDER',
           event: 'UPDATED',
@@ -92,6 +104,7 @@ async function start() {
           price: o.openPrice,
           sl: o.stopLoss,
           tp: o.takeProfit,
+          rr,
           time: o.time
         });
       }
@@ -103,8 +116,9 @@ async function start() {
     for (const p of positions) {
       const prev = prevPositions.get(p.id);
 
+      const rr = calculateRR(p.openPrice, p.stopLoss, p.takeProfit);
+
       if (prev && JSON.stringify(prev) !== JSON.stringify(p)) {
-        // sadece UPDATE (OPEN/CLOSE yok)
         await send({
           type: 'POSITION',
           event: 'UPDATED',
@@ -115,6 +129,7 @@ async function start() {
           sl: p.stopLoss,
           tp: p.takeProfit,
           profit: p.profit,
+          rr,
           time: p.time
         });
       }
