@@ -4,6 +4,79 @@ const token = process.env.METAAPI_TOKEN;
 const accountId = process.env.METAAPI_ACCOUNT_ID;
 const webhookUrl = process.env.WEBHOOK_URL;
 
+// Tüm listener metodlarını yakala
+class TradeListener {
+  constructor() {
+    this.synchronized = false;
+    this.startTime = new Date();
+  }
+
+  onConnected() {}
+  onDisconnected() {}
+  onBrokerConnectionStatusChanged() {}
+  onSynchronizationStarted() {}
+  onAccountInformationUpdated() {}
+  onPositionsReplaced() {}
+  onPositionUpdated() {}
+  onPositionRemoved() {}
+  onPendingOrdersReplaced() {}
+  onPendingOrderUpdated() {}
+  onPendingOrderCompleted() {}
+  onHistoryOrderAdded() {}
+  onHealthStatus() {}
+  onSymbolPriceUpdated() {}
+  onSymbolPricesUpdated() {}
+  onSymbolSpecificationsUpdated() {}
+  onSymbolSpecificationUpdated() {}
+  onCandlesUpdated() {}
+  onTicksUpdated() {}
+  onBooksUpdated() {}
+  onDealsSynchronized() {}
+  onHistoryOrdersSynchronized() {}
+  onOrderSynchronizationFinished() {}
+  onPositionsSynchronized() {}
+
+  async onSynchronized() {
+    this.synchronized = true;
+    console.log('Senkronizasyon tamamlandı, trade dinleniyor...');
+  }
+
+  async onDealAdded(instanceIndex, deal) {
+    if (!this.synchronized) return;
+
+    const dealTime = new Date(deal.time);
+    if (dealTime < this.startTime) return;
+
+    try {
+      const entryType = deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
+      const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
+
+      const payload = {
+        event: entryType,
+        symbol: deal.symbol,
+        direction: direction,
+        price: deal.price,
+        volume: deal.volume,
+        profit: deal.profit || 0,
+        ticket: deal.id,
+        time: deal.time
+      };
+
+      console.log('Yeni deal tespit edildi:', payload);
+
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      console.log('Webhook gönderildi, status:', response.status);
+    } catch (err) {
+      console.error('Webhook hatası:', err.message);
+    }
+  }
+}
+
 async function run() {
   console.log('MetaAPI Webhook Listener başlatılıyor...');
 
@@ -18,71 +91,7 @@ async function run() {
   console.log('MT5 hesabına bağlandı');
 
   const connection = account.getStreamingConnection();
-
-  let synchronized = false;
-  const startTime = new Date();
-
-  connection.addSynchronizationListener({
-    onConnected() {},
-    onDisconnected() {},
-    onBrokerConnectionStatusChanged() {},
-    onSynchronizationStarted() {},
-    onAccountInformationUpdated() {},
-    onPositionsReplaced() {},
-    onPositionUpdated() {},
-    onPositionRemoved() {},
-    onPendingOrdersReplaced() {},
-    onPendingOrderUpdated() {},
-    onPendingOrderCompleted() {},
-    onHistoryOrderAdded() {},
-    onHealthStatus() {},
-    onSymbolPriceUpdated() {},
-    onSymbolSpecificationsUpdated() {},
-    onSymbolSpecificationUpdated() {},
-    onCandlesUpdated() {},
-    onTicksUpdated() {},
-    onBooksUpdated() {},
-
-    async onSynchronized() {
-      synchronized = true;
-      console.log('Senkronizasyon tamamlandı, trade dinleniyor...');
-    },
-
-    async onDealAdded(instanceIndex, deal) {
-      if (!synchronized) return;
-
-      const dealTime = new Date(deal.time);
-      if (dealTime < startTime) return;
-
-      try {
-        const entryType = deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
-        const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
-
-        const payload = {
-          event: entryType,
-          symbol: deal.symbol,
-          direction: direction,
-          price: deal.price,
-          volume: deal.volume,
-          profit: deal.profit || 0,
-          ticket: deal.id,
-          time: deal.time
-        };
-
-        console.log('Yeni deal tespit edildi:', payload);
-
-        const response = await fetch(webhookUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-
-        console.log('Webhook gönderildi, status:', response.status);
-      } catch (err) {
-        console.error('Webhook hatası:', err.message);
-      }
-    }
-  });
+  connection.addSynchronizationListener(new TradeListener());
 
   await connection.connect();
   await connection.waitSynchronized();
