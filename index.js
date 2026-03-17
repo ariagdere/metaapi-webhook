@@ -79,6 +79,10 @@ while (!isReady) {
   console.log('sync bekleniyor...');
   await new Promise(r => setTimeout(r, 1000));
 }
+setInterval(() => {
+  const state = connection.terminalState;
+  console.log('positions:', state.positions.length);
+}, 5000);
 }
 
 start();
