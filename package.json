@@ -1,6 +1,6 @@
 {
   "name": "metaapi-webhook",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MetaAPI trade webhook listener",
   "main": "index.js",
   "scripts": {
