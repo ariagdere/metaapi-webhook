@@ -18,21 +18,39 @@ async function run() {
   console.log('MT5 hesabına bağlandı');
 
   const connection = account.getStreamingConnection();
-  
+
   let synchronized = false;
   const startTime = new Date();
 
   connection.addSynchronizationListener({
+    onConnected() {},
+    onDisconnected() {},
+    onBrokerConnectionStatusChanged() {},
+    onSynchronizationStarted() {},
+    onAccountInformationUpdated() {},
+    onPositionsReplaced() {},
+    onPositionUpdated() {},
+    onPositionRemoved() {},
+    onPendingOrdersReplaced() {},
+    onPendingOrderUpdated() {},
+    onPendingOrderCompleted() {},
+    onHistoryOrderAdded() {},
+    onHealthStatus() {},
+    onSymbolPriceUpdated() {},
+    onSymbolSpecificationsUpdated() {},
+    onSymbolSpecificationUpdated() {},
+    onCandlesUpdated() {},
+    onTicksUpdated() {},
+    onBooksUpdated() {},
+
     async onSynchronized() {
       synchronized = true;
       console.log('Senkronizasyon tamamlandı, trade dinleniyor...');
     },
 
     async onDealAdded(instanceIndex, deal) {
-      // Senkronizasyon tamamlanmadan gelen deal'leri yoksay
       if (!synchronized) return;
-      
-      // Başlangıç zamanından önce olan deal'leri yoksay
+
       const dealTime = new Date(deal.time);
       if (dealTime < startTime) return;
 
@@ -69,7 +87,6 @@ async function run() {
   await connection.connect();
   await connection.waitSynchronized();
 
-  // Bağlantı kapanmasın diye bekle
   await new Promise(() => {});
 }
 
