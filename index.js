@@ -4,12 +4,15 @@ const token = process.env.METAAPI_TOKEN;
 const accountId = process.env.METAAPI_ACCOUNT_ID;
 const webhookUrl = process.env.WEBHOOK_URL;
 
-async function run() {
-  console.log('MetaAPI Webhook Listener başlatılıyor...');
+const api = new MetaApi(token, { region: 'london' });
 
-  const api = new MetaApi(token, {
-    region: 'london'  // ✅ Hesap region'ı
-  });
+let connection = null;
+let isReady = false;
+
+async function initConnection() {
+  if (connection) return connection;
+
+  console.log('MetaAPI bağlanıyor...');
 
   const account = await api.metatraderAccountApi.getAccount(accountId);
 
@@ -20,14 +23,11 @@ async function run() {
   await account.waitConnected();
   console.log('MT5 hesabına bağlandı');
 
-  const connection = account.getRPCConnection();
-  await connection.connect();
-
-  let isReady = false;
+  connection = account.getStreamingConnection();
 
   connection.addSynchronizationListener({
-    async onSynchronized(instanceIndex) {
-      console.log('Senkronizasyon tamamlandı, yeni trade\'ler dinleniyor...');
+    async onSynchronized() {
+      console.log('Senkronizasyon tamamlandı');
       isReady = true;
     },
 
@@ -35,22 +35,25 @@ async function run() {
       if (!isReady) return;
 
       try {
-        const entryType = deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
-        const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
+        const entryType =
+          deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
 
-const payload = {
-  event: entryType,
-  symbol: deal.symbol,
-  direction: direction,
-  price: deal.price,
-  volume: deal.volume,
-  profit: deal.profit || 0,
-  dealId: deal.id,           // bu deal'in kendi ID'si
-  positionId: deal.positionId, // 🔑 OPEN ve CLOSE'u birbirine bağlar
-  time: deal.time
-};
+        const direction =
+          deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
 
-        console.log('Yeni deal tespit edildi:', payload);
+        const payload = {
+          event: entryType,
+          symbol: deal.symbol,
+          direction,
+          price: deal.price,
+          volume: deal.volume,
+          profit: deal.profit || 0,
+          dealId: deal.id,
+          positionId: deal.positionId,
+          time: deal.time
+        };
+
+        console.log('Yeni deal:', payload);
 
         const response = await fetch(webhookUrl, {
           method: 'POST',
@@ -58,25 +61,37 @@ const payload = {
           body: JSON.stringify(payload)
         });
 
-        console.log('Webhook gönderildi, status:', response.status);
+        console.log('Webhook gönderildi:', response.status);
       } catch (err) {
         console.error('Webhook hatası:', err.message);
       }
     }
   });
 
+  await connection.connect();
   await connection.waitSynchronized();
+
+  return connection;
 }
 
-async function startWithRetry() {
+async function start() {
   while (true) {
     try {
-      await run();
+      await initConnection();
+
+      // connection canlı kalsın diye sleep
+      await new Promise(resolve => setTimeout(resolve, 60000));
+
     } catch (err) {
-      console.error('Hata, 10 saniye sonra yeniden bağlanılacak:', err.message);
+      console.error('Hata:', err.message);
+
+      // 🔥 önemli: connection reset
+      connection = null;
+      isReady = false;
+
       await new Promise(resolve => setTimeout(resolve, 10000));
     }
   }
 }
 
-startWithRetry();
+start();
