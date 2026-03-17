@@ -6,10 +6,9 @@ const webhookUrl = process.env.WEBHOOK_URL;
 
 const api = new MetaApi(token, { region: 'london' });
 
-// sadece yeni trade'leri almak için
 const startTime = new Date();
+const seenDeals = new Set();
 
-// crash olmaması için safe listener
 function createSafeListener(handler) {
   return new Proxy(handler, {
     get(target, prop) {
@@ -20,8 +19,6 @@ function createSafeListener(handler) {
 }
 
 async function start() {
-  console.log('Başlatılıyor...');
-
   const account = await api.metatraderAccountApi.getAccount(accountId);
 
   if (account.state !== 'DEPLOYED') {
@@ -29,15 +26,18 @@ async function start() {
   }
 
   await account.waitConnected();
-  console.log('MT5 connected');
 
   const connection = account.getStreamingConnection();
 
   const listener = createSafeListener({
     async onDealAdded(instanceIndex, deal) {
 
-      // 🔥 SADECE YENİ TRADE
+      // 🔥 geçmişi ele
       if (new Date(deal.time) < startTime) return;
+
+      // 🔥 duplicate engelle
+      if (seenDeals.has(deal.id)) return;
+      seenDeals.add(deal.id);
 
       const payload = {
         event: deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE',
@@ -53,15 +53,11 @@ async function start() {
 
       console.log('Yeni deal:', payload);
 
-      try {
-        await fetch(webhookUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-      } catch (err) {
-        console.error('Webhook error:', err.message);
-      }
+      await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
     }
   });
 
@@ -69,7 +65,7 @@ async function start() {
 
   await connection.connect();
 
-  console.log('🚀 Hazır. Sadece yeni trade’ler gönderilecek.');
+  console.log('🚀 Hazır. Duplicate yok.');
 }
 
 start();
