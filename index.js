@@ -8,7 +8,7 @@ const api = new MetaApi(token, { region: 'london' });
 
 const startTime = new Date();
 const seenDeals = new Set();
-const seenOrders = new Set();
+const knownOrders = new Set();
 
 function createSafeListener(handler) {
   return new Proxy(handler, {
@@ -35,7 +35,7 @@ async function start() {
 
   const listener = createSafeListener({
 
-    // ✅ DEAL (çalışıyordu zaten)
+    // ✅ DEAL (zaten çalışıyor)
     async onDealAdded(instanceIndex, deal) {
 
       if (new Date(deal.time) < startTime) return;
@@ -63,39 +63,6 @@ async function start() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-    },
-
-    // 🔥 ORDER (BU DEĞİŞTİ → artık buradan geliyor)
-    async onOrdersReplaced(instanceIndex, orders) {
-
-      for (const order of orders) {
-
-        if (!order.time) continue;
-        if (new Date(order.time) < startTime) continue;
-        if (seenOrders.has(order.id)) continue;
-        seenOrders.add(order.id);
-
-        if (order.state !== 'ORDER_STATE_PLACED') continue;
-
-        const payload = {
-          type: 'ORDER',
-          event: 'PLACED',
-          symbol: order.symbol,
-          orderType: order.type,
-          volume: order.volume,
-          price: order.openPrice,
-          orderId: order.id,
-          time: order.time
-        };
-
-        console.log('ORDER:', payload);
-
-        await fetch(webhookUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-      }
     }
 
   });
@@ -104,7 +71,43 @@ async function start() {
 
   await connection.connect();
 
-  console.log('🚀 Hazır. DEAL + ORDER aktif.');
+  console.log('🚀 Hazır. DEAL + ORDER polling aktif');
+
+  // 🔥 ORDER’ları polling ile yakala (KESİN ÇALIŞIR)
+  setInterval(async () => {
+    const orders = connection.terminalState.orders;
+
+    for (const order of orders) {
+
+      if (!order.time) continue;
+      if (new Date(order.time) < startTime) continue;
+      if (knownOrders.has(order.id)) continue;
+
+      knownOrders.add(order.id);
+
+      if (order.state !== 'ORDER_STATE_PLACED') continue;
+
+      const payload = {
+        type: 'ORDER',
+        event: 'PLACED',
+        symbol: order.symbol,
+        orderType: order.type,
+        volume: order.volume,
+        price: order.openPrice,
+        orderId: order.id,
+        time: order.time
+      };
+
+      console.log('ORDER:', payload);
+
+      await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    }
+
+  }, 1000); // 1 sn
 }
 
 start();
