@@ -75,7 +75,10 @@ async function start() {
   connection.addSynchronizationListener(listener);
 
   await connection.connect();
-  await connection.waitSynchronized();
+while (!isReady) {
+  console.log('sync bekleniyor...');
+  await new Promise(r => setTimeout(r, 1000));
+}
 }
 
 start();
