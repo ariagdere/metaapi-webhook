@@ -68,12 +68,34 @@ async function initConnection() {
       }
     },
 
-    // 🔥 CRASH FIX (zorunlu boş listenerlar)
-    async onSymbolSpecificationUpdated() {},
-    async onSymbolPriceUpdated() {},
+    // 🔥 TÜM GEREKLİ BOŞ METHODLAR (ARTIK HATA YOK)
+    async onConnected() {},
+    async onDisconnected() {},
+    async onBrokerConnectionStatusChanged() {},
+
     async onAccountInformationUpdated() {},
     async onPositionsReplaced() {},
-    async onOrdersReplaced() {}
+    async onPositionUpdated() {},
+    async onPositionRemoved() {},
+
+    async onOrdersReplaced() {},
+    async onOrderUpdated() {},
+    async onOrderCompleted() {},
+
+    async onHistoryOrderAdded() {},
+    async onDealAdded() {}, // zaten yukarıda var ama safe
+
+    async onSymbolSpecificationUpdated() {},
+    async onSymbolSpecificationRemoved() {},
+    async onSymbolPriceUpdated() {},
+
+    async onCandlesUpdated() {},
+    async onTicksUpdated() {},
+    async onBooksUpdated() {},
+
+    async onSubscriptionDowngraded() {},
+    async onStreamClosed() {},
+    async onHealthStatus() {}
   });
 
   await connection.connect();
@@ -87,13 +109,11 @@ async function start() {
     try {
       await initConnection();
 
-      // connection açık kalsın
       await new Promise(resolve => setTimeout(resolve, 60000));
 
     } catch (err) {
       console.error('Hata:', err.message);
 
-      // reset (subscription leak engeller)
       connection = null;
       isReady = false;
 
