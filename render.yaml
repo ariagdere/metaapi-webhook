@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: metaapi-webhook
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: METAAPI_TOKEN
+        sync: false
+      - key: METAAPI_ACCOUNT_ID
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false

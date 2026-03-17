@@ -1,0 +1,15 @@
+{
+  "name": "metaapi-webhook",
+  "version": "1.0.0",
+  "description": "MetaAPI trade webhook listener",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "metaapi.cloud-sdk": "latest"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
