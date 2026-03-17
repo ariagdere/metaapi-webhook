@@ -6,24 +6,24 @@ const webhookUrl = process.env.WEBHOOK_URL;
 
 async function run() {
   console.log('MetaAPI Webhook Listener başlatılıyor...');
-  
+
   const api = new MetaApi(token);
-  
   const account = await api.metatraderAccountApi.getAccount(accountId);
-  
+
   if (account.state !== 'DEPLOYED') {
     await account.deploy();
   }
-  
+
   await account.waitConnected();
   console.log('MT5 hesabına bağlandı');
 
-  const connection = account.getRPCConnection();
-  await connection.connect();
-  await connection.waitSynchronized();
-  console.log('Senkronizasyon tamamlandı, trade dinleniyor...');
+  const connection = account.getStreamingConnection();
 
   connection.addSynchronizationListener({
+    async onSynchronized() {
+      console.log('Senkronizasyon tamamlandı, trade dinleniyor...');
+    },
+
     async onDealAdded(instanceIndex, deal) {
       try {
         const entryType = deal.entryType === 'DEAL_ENTRY_IN' ? 'OPEN' : 'CLOSE';
@@ -54,9 +54,14 @@ async function run() {
       }
     }
   });
+
+  await connection.connect();
+  await connection.waitSynchronized();
+  
+  // Bağlantı kapanmasın diye bekle
+  await new Promise(() => {});
 }
 
-// Bağlantı kopunca yeniden bağlan
 async function startWithRetry() {
   while (true) {
     try {
