@@ -1,15 +1,16 @@
 {
-  "name": "metaapi-webhook",
-  "version": "1.0.1",
-  "description": "MetaAPI trade webhook listener",
-  "main": "index.js",
+  "name": "mt5-order-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "main": "mt5_order_monitor.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node mt5_order_monitor.js"
   },
   "dependencies": {
-    "metaapi.cloud-sdk": "latest"
+    "metaapi.cloud-sdk": "^25",
+    "pg": "^8.11.5"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
   }
 }
