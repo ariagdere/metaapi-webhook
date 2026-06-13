@@ -5,6 +5,7 @@ const token = process.env.METAAPI_TOKEN;
 const accountId = process.env.METAAPI_ACCOUNT_ID;
 const databaseUrl = process.env.DATABASE_URL;
 const expiryHours = parseInt(process.env.PENDING_EXPIRY_HOURS || '8', 10);
+const notifyWebhookUrl = process.env.NOTIFY_WEBHOOK_URL || 'https://hook.eu2.make.com/nc9p8mvzsn46mqolimwfpktp9yqpzt28';
 
 const api = new MetaApi(token, { region: 'london' });
 const pool = new Pool({ connectionString: databaseUrl });
@@ -95,6 +96,31 @@ async function insertManualOrder(data) {
   return rows[0].id;
 }
 
+// -------------------- WEBHOOK NOTIFY --------------------
+
+async function notifyMake(eventType, order, extra = {}) {
+  try {
+    await fetch(notifyWebhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: eventType, // 'OPENED' | 'CLOSED' | 'EXPIRED'
+        order_id: order.id,
+        analysis_id: order.analysis_id,
+        mt5_order_id: order.mt5_order_id,
+        mt5_position_id: order.mt5_position_id,
+        magic: order.magic,
+        strategy_label: order.strategy_label,
+        symbol: order.symbol,
+        direction: order.direction,
+        ...extra,
+      }),
+    });
+  } catch (err) {
+    console.error(`notifyMake hatası (${eventType}, order_id=${order.id}):`, err.message);
+  }
+}
+
 // -------------------- MAIN --------------------
 
 async function start() {
@@ -144,6 +170,14 @@ async function handleDealIn(deal, connection) {
       [deal.positionId, deal.price, deal.time, existing.id]
     );
     await insertOrderEvent(existing.id, 'OPENED', { price: deal.price, rawPayload: deal });
+    if (existing.strategy_label !== 'MANUAL') {
+      await notifyMake('OPENED', existing, {
+        fill_price: deal.price,
+        sl: existing.sl,
+        tp: existing.tp,
+        volume: existing.volume,
+      });
+    }
     return;
   }
 
@@ -191,6 +225,15 @@ async function handleDealOut(deal) {
     profit: deal.profit ?? 0,
     rawPayload: deal,
   });
+
+  if (order.strategy_label !== 'MANUAL') {
+    await notifyMake('CLOSED', order, {
+      close_price: deal.price,
+      profit: deal.profit ?? 0,
+      exit_reason: exitReason,
+      is_manual: isManual,
+    });
+  }
 }
 
 // deal.reason güvenilir değilse fiyat-tolerans fallback kullanılır
@@ -322,8 +365,10 @@ async function pollPositions(connection) {
 
 async function expireOldPendingOrders(connection) {
   const { rows } = await pool.query(
-    `SELECT id, mt5_order_id FROM orders
-     WHERE status='PENDING' AND created_at < now() - interval '${expiryHours} hours'`
+    `SELECT id, mt5_order_id, analysis_id, magic, strategy_label, symbol, direction
+     FROM orders
+     WHERE status='PENDING' AND strategy_label != 'MANUAL'
+       AND created_at < now() - interval '${expiryHours} hours'`
   );
 
   for (const row of rows) {
@@ -339,6 +384,7 @@ async function expireOldPendingOrders(connection) {
       [row.id]
     );
     await insertOrderEvent(row.id, 'CANCELED', { isManual: false, source: 'poller_8h_expiry' });
+    await notifyMake('EXPIRED', row, { exit_reason: 'EXPIRED' });
   }
 }
 
