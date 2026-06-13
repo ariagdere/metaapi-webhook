@@ -317,12 +317,35 @@ async function pollOrders(connection) {
     prevOrders.set(o.id, { openPrice: o.openPrice, stopLoss: o.stopLoss, takeProfit: o.takeProfit });
   }
 
-  // Kaybolan order'lar -> manuel iptal (deal gelmediyse, hala PENDING ise)
+  // Kaybolan order'lar -> manuel iptal AMA fill olduysa (position'a dondu) dokunma
+  const openPositionIds = new Set(connection.terminalState.positions.map(p => String(p.id)));
   for (const id of [...prevOrders.keys()]) {
     if (currentIds.has(id)) continue;
 
+    // Order listeden kalkti. Iki olasilik:
+    // 1) fill oldu -> ayni id'li bir position var, ya da DB'de zaten OPEN/CLOSED
+    // 2) gercekten iptal edildi -> position yok ve DB hala PENDING
     const existing = await getOrderByMt5Id(id);
-    if (existing && existing.status === 'PENDING') {
+
+    // DB'de artik PENDING degilse (OPEN/CLOSED olmus) takipten dusur, dokunma
+    if (!existing || existing.status !== 'PENDING') {
+      prevOrders.delete(id);
+      continue;
+    }
+
+    {
+      const hasPosition =
+        openPositionIds.has(String(id)) ||
+        (existing.mt5_position_id && openPositionIds.has(String(existing.mt5_position_id)));
+
+      if (hasPosition) {
+        // Fill olmus, onDealAdded birazdan OPEN yapacak -> iptal etme
+        continue;
+      }
+
+      const ageMs = Date.now() - new Date(existing.created_at).getTime();
+      if (ageMs < 3000) continue; // fill deal gecikmesine tolerans
+
       await pool.query(
         `UPDATE orders SET status='CANCELED', exit_reason=NULL, is_manual=true, closed_at=now(), updated_at=now() WHERE id=$1`,
         [existing.id]
