@@ -10,7 +10,6 @@ const notifyWebhookUrl = process.env.NOTIFY_WEBHOOK_URL || 'https://hook.eu2.mak
 const api = new MetaApi(token, { region: 'london' });
 const pool = new Pool({ connectionString: databaseUrl });
 
-const startTime = new Date();
 const seenDeals = new Set();
 const prevOrders = new Map();
 const prevPositions = new Map();
@@ -154,8 +153,10 @@ async function start() {
 
   const listener = createSafeListener({
     async onDealAdded(instanceIndex, deal) {
-      if (new Date(deal.time) < startTime) return;
-      if (seenDeals.has(deal.id)) return;
+      // startTime filtresi KALDIRILDI: script restart/reconnect sonrasi resync ile
+      // gelen gecmis deal'lerin de islenmesi gerek. Idempotency DB durumuyla saglanir
+      // (handleDealIn: order zaten OPEN mi; handleDealOut: order zaten CLOSED mi).
+      if (seenDeals.has(deal.id)) return; // ayni oturumda tekrar islemeyi onler
       seenDeals.add(deal.id);
 
       if (deal.entryType === 'DEAL_ENTRY_IN') {
@@ -242,6 +243,11 @@ async function handleDealOut(deal) {
   const order = await getOrderByPositionId(deal.positionId);
   if (!order) {
     console.warn(`DEAL_ENTRY_OUT: order bulunamadı (positionId=${deal.positionId})`);
+    return;
+  }
+
+  // Idempotency: order zaten CLOSED ise (resync/restart sonrasi tekrar gelen deal) atla.
+  if (order.status === 'CLOSED') {
     return;
   }
 
