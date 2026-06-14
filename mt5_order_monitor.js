@@ -15,6 +15,25 @@ const seenDeals = new Set();
 const prevOrders = new Map();
 const prevPositions = new Map();
 
+// Magic -> strateji etiketi. Yeni strateji eklemek icin buraya satir ekle + redeploy.
+const STRATEGY_MAP = {
+  6130450: 'V6_Latest 50+',
+};
+
+// Order/deal sisteme mi ait? comment (analysis_id) dolu VEYA magic STRATEGY_MAP'te ise evet.
+function resolveStrategyLabel(magic) {
+  return STRATEGY_MAP[Number(magic)] || null;
+}
+
+// comment alanindan analysis_id parse et (sadece sayi bekliyoruz, orn "874")
+function parseAnalysisId(comment) {
+  if (comment == null) return null;
+  const s = String(comment).trim();
+  if (!s) return null;
+  const n = parseInt(s, 10);
+  return Number.isNaN(n) ? null : n;
+}
+
 function createSafeListener(handler) {
   return new Proxy(handler, {
     get(target, prop) {
@@ -69,23 +88,25 @@ async function insertOrderEvent(orderId, eventType, opts = {}) {
   );
 }
 
-// Insert a row for activity Make didn't create (manual order / manual position)
-async function insertManualOrder(data) {
+// Insert a new order row (system or manual). Streaming tek yazma noktasi.
+async function insertOrder(data) {
   const { rows } = await pool.query(
     `INSERT INTO orders
-       (mt5_order_id, mt5_position_id, magic, strategy_label, symbol, direction,
+       (analysis_id, mt5_order_id, mt5_position_id, magic, strategy_label, symbol, direction,
         volume, entry_price, fill_price, sl, tp, rr, status, opened_at)
-     VALUES ($1,$2,$3,'MANUAL',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
      RETURNING id`,
     [
+      data.analysisId ?? null,
       data.mt5OrderId,
-      data.mt5PositionId,
+      data.mt5PositionId ?? null,
       data.magic ?? 0,
+      data.strategyLabel ?? 'MANUAL',
       data.symbol,
       data.direction,
       data.volume,
       data.entryPrice,
-      data.fillPrice,
+      data.fillPrice ?? null,
       data.sl,
       data.tp,
       calculateRR(data.entryPrice, data.sl, data.tp),
@@ -181,13 +202,20 @@ async function handleDealIn(deal, connection) {
     return;
   }
 
-  // Eşleşme yok -> manuel market order
+  // Eslesme yok (order PENDING kaydi henuz olusmadiysa direkt market fill olmus olabilir).
+  // comment (analysis_id) veya bilinen magic varsa sistem order'i; yoksa gercek manuel.
   const position = connection.terminalState.positions.find(p => p.id === deal.positionId);
+  const analysisId = parseAnalysisId(deal.comment ?? deal.brokerComment);
+  const strategyLabel = resolveStrategyLabel(deal.magic);
+  const isSystem = analysisId != null || strategyLabel != null;
   const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
-  const id = await insertManualOrder({
+
+  const id = await insertOrder({
+    analysisId: isSystem ? analysisId : null,
     mt5OrderId: deal.orderId,
     mt5PositionId: deal.positionId,
     magic: deal.magic,
+    strategyLabel: isSystem ? (strategyLabel ?? `MAGIC_${deal.magic}`) : 'MANUAL',
     symbol: deal.symbol,
     direction,
     volume: deal.volume,
@@ -200,6 +228,14 @@ async function handleDealIn(deal, connection) {
   });
   await insertOrderEvent(id, 'CREATED', { source: 'streaming', rawPayload: deal });
   await insertOrderEvent(id, 'OPENED', { price: deal.price, source: 'streaming', rawPayload: deal });
+
+  // Sistem order'i ise OPENED bildirimini Make'e gonder
+  if (isSystem) {
+    const order = await getOrderByMt5Id(deal.orderId);
+    if (order) {
+      await notifyMake('OPENED', order, { fill_price: deal.price, sl: order.sl, tp: order.tp, volume: order.volume });
+    }
+  }
 }
 
 async function handleDealOut(deal) {
@@ -273,12 +309,19 @@ async function pollOrders(connection) {
     if (!prev) {
       const existing = await getOrderByMt5Id(o.id);
       if (!existing) {
-        // Make tarafından insert edilmemiş -> manuel pending order
+        // Tek yazma noktasi streaming. comment (analysis_id) veya bilinen magic varsa
+        // sistem order'i; yoksa gercek manuel.
+        const analysisId = parseAnalysisId(o.comment ?? o.brokerComment);
+        const strategyLabel = resolveStrategyLabel(o.magic);
+        const isSystem = analysisId != null || strategyLabel != null;
+
         const direction = o.type?.includes('SELL') ? 'SELL' : 'BUY';
-        const id = await insertManualOrder({
+        const id = await insertOrder({
+          analysisId: isSystem ? analysisId : null,
           mt5OrderId: o.id,
           mt5PositionId: null,
           magic: o.magic,
+          strategyLabel: isSystem ? (strategyLabel ?? `MAGIC_${o.magic}`) : 'MANUAL',
           symbol: o.symbol,
           direction,
           volume: o.volume,
