@@ -185,6 +185,11 @@ async function handleDealIn(deal, connection) {
   const existing = await getOrderByMt5Id(deal.orderId);
 
   if (existing) {
+    // Sadece PENDING -> OPEN gecisine izin ver. Zaten OPEN ise duplicate (resync),
+    // CLOSED ise gecmis bir order'in tekrar gelen IN deal'i -> ikisinde de dokunma.
+    if (existing.status !== 'PENDING') {
+      return;
+    }
     await pool.query(
       `UPDATE orders
          SET status='OPEN', mt5_position_id=$1, fill_price=$2, opened_at=$3, updated_at=now()
