@@ -3,7 +3,6 @@ const { Pool } = require('pg');
 const token = process.env.METAAPI_TOKEN;
 const accountId = process.env.METAAPI_ACCOUNT_ID;
 const databaseUrl = process.env.DATABASE_URL;
-const expiryHours = parseInt(process.env.PENDING_EXPIRY_HOURS || '8', 10);
 const notifyWebhookUrl = process.env.NOTIFY_WEBHOOK_URL || 'https://hook.eu2.make.com/nc9p8mvzsn46mqolimwfpktp9yqpzt28';
 const api = new MetaApi(token, { region: 'london' });
 const pool = new Pool({ connectionString: databaseUrl });
@@ -17,11 +16,9 @@ const STRATEGY_MAP = {
   6310570: 'V6 70+',
   68040: 'V6 80+ 40-',
 };
-// Order/deal sisteme mi ait? comment (analysis_id) dolu VEYA magic STRATEGY_MAP'te ise evet.
 function resolveStrategyLabel(magic) {
   return STRATEGY_MAP[Number(magic)] || null;
 }
-// comment alanindan analysis_id parse et (sadece sayi bekliyoruz, orn "874")
 function parseAnalysisId(comment) {
   if (comment == null) return null;
   const s = String(comment).trim();
@@ -77,7 +74,6 @@ async function insertOrderEvent(orderId, eventType, opts = {}) {
     ]
   );
 }
-// Insert a new order row (system or manual). Streaming tek yazma noktasi.
 async function insertOrder(data) {
   const { rows } = await pool.query(
     `INSERT INTO orders
@@ -152,7 +148,6 @@ async function start() {
   console.log('🚀 Order monitor active');
   setInterval(() => pollOrders(connection), 1500);
   setInterval(() => pollPositions(connection), 1500);
-  setInterval(() => expireOldPendingOrders(connection), 5 * 60 * 1000);
 }
 // -------------------- DEAL HANDLERS --------------------
 async function handleDealIn(deal, connection) {
@@ -351,29 +346,6 @@ async function pollPositions(connection) {
       }
     }
     prevPositions.set(p.id, { stopLoss: p.stopLoss, takeProfit: p.takeProfit });
-  }
-}
-// -------------------- EXPIRY POLLER --------------------
-async function expireOldPendingOrders(connection) {
-  const { rows } = await pool.query(
-    `SELECT id, mt5_order_id, analysis_id, magic, strategy_label, symbol, direction
-     FROM orders
-     WHERE status='PENDING' AND strategy_label != 'MANUAL'
-       AND created_at < now() - interval '${expiryHours} hours'`
-  );
-  for (const row of rows) {
-    try {
-      await connection.cancelOrder(row.mt5_order_id);
-    } catch (err) {
-      console.error(`ORDER_CANCEL hatası (id=${row.mt5_order_id}):`, err.message);
-      continue;
-    }
-    await pool.query(
-      `UPDATE orders SET status='CANCELED', exit_reason='EXPIRED', is_manual=false, closed_at=now(), updated_at=now() WHERE id=$1`,
-      [row.id]
-    );
-    await insertOrderEvent(row.id, 'CANCELED', { isManual: false, source: 'poller_8h_expiry' });
-    await notifyMake('EXPIRED', row, { exit_reason: 'EXPIRED' });
   }
 }
 start().catch(err => {
