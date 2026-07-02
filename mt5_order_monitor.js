@@ -15,6 +15,7 @@ const STRATEGY_MAP = {
   6130450: 'V6_Latest 50+',
   6310560: 'V6 60+',
   6310570: 'V6 70+',
+  68040: 'V6 80+ 40-',
 };
 // Order/deal sisteme mi ait? comment (analysis_id) dolu VEYA magic STRATEGY_MAP'te ise evet.
 function resolveStrategyLabel(magic) {
