@@ -15,6 +15,7 @@ const STRATEGY_MAP = {
   6310560: 'V6 60+',
   6310570: 'V6 70+',
   68040: 'V6 80+ 40-',
+  65050: 'V6 50- 50+',
 };
 function resolveStrategyLabel(magic) {
   return STRATEGY_MAP[Number(magic)] || null;
