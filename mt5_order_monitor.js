@@ -15,7 +15,6 @@ const STRATEGY_MAP = {
   6310560: 'V6 60+',
   6310570: 'V6 70+',
   68040: 'V6 80+ 40-',
-  65050: 'V6 50- 50+',
 };
 function resolveStrategyLabel(magic) {
   return STRATEGY_MAP[Number(magic)] || null;
@@ -75,12 +74,41 @@ async function insertOrderEvent(orderId, eventType, opts = {}) {
     ]
   );
 }
+// analysis'in orijinal entry/sl'inden sizing_risk_distance hesaplayip
+// r_target (TP olursa kazanc) ve r_risk (SL olursa kayip) turetir.
+// Normal trade'de bu, order'in kendi entry/sl/tp'siyle ayni cikar (mevcut davranisla tutarli).
+// Inverse trade'de volume degismedigi icin orijinal risk mesafesi baz alinir.
+async function calculateRTargetRisk(analysisId, entryPrice, sl, tp) {
+  if (analysisId == null) {
+    return { rTarget: null, rRisk: 1 }; // MANUAL/analysis'siz order -> varsayilan
+  }
+  const { rows } = await pool.query(
+    `SELECT entry, sl FROM btc_analysis WHERE id = $1`,
+    [analysisId]
+  );
+  const a = rows[0];
+  if (!a || a.entry == null || a.sl == null) {
+    return { rTarget: null, rRisk: 1 };
+  }
+  const sizingRiskDistance = Math.abs(Number(a.entry) - Number(a.sl));
+  if (sizingRiskDistance === 0) {
+    return { rTarget: null, rRisk: 1 };
+  }
+  const rTarget = tp != null ? Number((Math.abs(tp - entryPrice) / sizingRiskDistance).toFixed(4)) : null;
+  const rRisk = sl != null ? Number((Math.abs(sl - entryPrice) / sizingRiskDistance).toFixed(4)) : 1;
+  return { rTarget, rRisk };
+}
+
+// Insert a new order row (system or manual). Streaming tek yazma noktasi.
 async function insertOrder(data) {
+  const { rTarget, rRisk } = await calculateRTargetRisk(
+    data.analysisId ?? null, data.entryPrice, data.sl, data.tp
+  );
   const { rows } = await pool.query(
     `INSERT INTO orders
        (analysis_id, mt5_order_id, mt5_position_id, magic, strategy_label, symbol, direction,
-        volume, entry_price, fill_price, sl, tp, rr, status, opened_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        volume, entry_price, fill_price, sl, tp, rr, r_target, r_risk, status, opened_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
      RETURNING id`,
     [
       data.analysisId ?? null,
@@ -96,6 +124,8 @@ async function insertOrder(data) {
       data.sl,
       data.tp,
       calculateRR(data.entryPrice, data.sl, data.tp),
+      rTarget,
+      rRisk,
       data.status,
       data.openedAt ?? null,
     ]
@@ -285,9 +315,12 @@ async function pollOrders(connection) {
     ) {
       const existing = await getOrderByMt5Id(o.id);
       if (existing) {
+        const { rTarget, rRisk } = await calculateRTargetRisk(
+          existing.analysis_id, o.openPrice, o.stopLoss, o.takeProfit
+        );
         await pool.query(
-          `UPDATE orders SET entry_price=$1, sl=$2, tp=$3, rr=$4, updated_at=now() WHERE id=$5`,
-          [o.openPrice, o.stopLoss, o.takeProfit, calculateRR(o.openPrice, o.stopLoss, o.takeProfit), existing.id]
+          `UPDATE orders SET entry_price=$1, sl=$2, tp=$3, rr=$4, r_target=$5, r_risk=$6, updated_at=now() WHERE id=$7`,
+          [o.openPrice, o.stopLoss, o.takeProfit, calculateRR(o.openPrice, o.stopLoss, o.takeProfit), rTarget, rRisk, existing.id]
         );
         if (prev.stopLoss !== o.stopLoss) {
           await insertOrderEvent(existing.id, 'MODIFIED', { isManual: true, oldValue: prev.stopLoss, newValue: o.stopLoss, rawPayload: o });
@@ -334,9 +367,12 @@ async function pollPositions(connection) {
     if (prev && (prev.stopLoss !== p.stopLoss || prev.takeProfit !== p.takeProfit)) {
       const existing = await getOrderByPositionId(p.id);
       if (existing) {
+        const { rTarget, rRisk } = await calculateRTargetRisk(
+          existing.analysis_id, existing.fill_price, p.stopLoss, p.takeProfit
+        );
         await pool.query(
-          `UPDATE orders SET sl=$1, tp=$2, rr=$3, updated_at=now() WHERE id=$4`,
-          [p.stopLoss, p.takeProfit, calculateRR(existing.fill_price, p.stopLoss, p.takeProfit), existing.id]
+          `UPDATE orders SET sl=$1, tp=$2, rr=$3, r_target=$4, r_risk=$5, updated_at=now() WHERE id=$6`,
+          [p.stopLoss, p.takeProfit, calculateRR(existing.fill_price, p.stopLoss, p.takeProfit), rTarget, rRisk, existing.id]
         );
         if (prev.stopLoss !== p.stopLoss) {
           await insertOrderEvent(existing.id, 'MODIFIED', { isManual: true, oldValue: prev.stopLoss, newValue: p.stopLoss, rawPayload: p });
