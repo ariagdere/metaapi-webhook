@@ -22,12 +22,21 @@ const STRATEGY_MAP = {
 function resolveStrategyLabel(magic) {
   return STRATEGY_MAP[Number(magic)] || null;
 }
-function parseAnalysisId(comment) {
-  if (comment == null) return null;
+// Comment iki şekilde gelebilir:
+//  - Düz sayı  -> mevcut stratejiler, analysis_id order açılırken zaten biliniyor
+//  - Diğer string -> Naif Aligned gibi hızlı yol stratejileri, apify_run_id
+// String("123") === "123" kontrolü, "123abc" gibi kısmi sayısal string'lerin
+// yanlışlıkla analysis_id sanılmasını engeller (parseInt baştaki rakamları
+// keser, biz TAM sayı eşleşmesi istiyoruz).
+function parseCommentField(comment) {
+  if (comment == null) return { analysisId: null, apifyRunId: null };
   const s = String(comment).trim();
-  if (!s) return null;
+  if (!s) return { analysisId: null, apifyRunId: null };
   const n = parseInt(s, 10);
-  return Number.isNaN(n) ? null : n;
+  if (!Number.isNaN(n) && String(n) === s) {
+    return { analysisId: n, apifyRunId: null };
+  }
+  return { analysisId: null, apifyRunId: s };
 }
 function createSafeListener(handler) {
   return new Proxy(handler, {
@@ -109,12 +118,13 @@ async function insertOrder(data) {
   );
   const { rows } = await pool.query(
     `INSERT INTO orders
-       (analysis_id, mt5_order_id, mt5_position_id, magic, strategy_label, symbol, direction,
+       (analysis_id, apify_run_id, mt5_order_id, mt5_position_id, magic, strategy_label, symbol, direction,
         volume, entry_price, fill_price, sl, tp, rr, r_target, r_risk, status, opened_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
      RETURNING id`,
     [
       data.analysisId ?? null,
+      data.apifyRunId ?? null,
       data.mt5OrderId,
       data.mt5PositionId ?? null,
       data.magic ?? 0,
@@ -207,12 +217,13 @@ async function handleDealIn(deal, connection) {
     return;
   }
   const position = connection.terminalState.positions.find(p => p.id === deal.positionId);
-  const analysisId = parseAnalysisId(deal.comment ?? deal.brokerComment);
+  const { analysisId, apifyRunId } = parseCommentField(deal.comment ?? deal.brokerComment);
   const strategyLabel = resolveStrategyLabel(deal.magic);
-  const isSystem = analysisId != null || strategyLabel != null;
+  const isSystem = analysisId != null || apifyRunId != null || strategyLabel != null;
   const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
   const id = await insertOrder({
     analysisId: isSystem ? analysisId : null,
+    apifyRunId: isSystem ? apifyRunId : null,
     mt5OrderId: deal.orderId,
     mt5PositionId: deal.positionId,
     magic: deal.magic,
@@ -290,12 +301,13 @@ async function pollOrders(connection) {
     if (!prev) {
       const existing = await getOrderByMt5Id(o.id);
       if (!existing) {
-        const analysisId = parseAnalysisId(o.comment ?? o.brokerComment);
+        const { analysisId, apifyRunId } = parseCommentField(o.comment ?? o.brokerComment);
         const strategyLabel = resolveStrategyLabel(o.magic);
-        const isSystem = analysisId != null || strategyLabel != null;
+        const isSystem = analysisId != null || apifyRunId != null || strategyLabel != null;
         const direction = o.type?.includes('SELL') ? 'SELL' : 'BUY';
         const id = await insertOrder({
           analysisId: isSystem ? analysisId : null,
+          apifyRunId: isSystem ? apifyRunId : null,
           mt5OrderId: o.id,
           mt5PositionId: null,
           magic: o.magic,
