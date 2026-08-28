@@ -183,7 +183,7 @@ async function start() {
       if (deal.entryType === 'DEAL_ENTRY_IN') {
         await handleDealIn(deal, connection);
       } else if (deal.entryType === 'DEAL_ENTRY_OUT') {
-        await handleDealOut(deal);
+        await handleDealOut(deal, connection);
       }
     }
   });
@@ -247,31 +247,71 @@ async function handleDealIn(deal, connection) {
     }
   }
 }
-async function handleDealOut(deal) {
+async function handleDealOut(deal, connection) {
   const order = await getOrderByPositionId(deal.positionId);
   if (!order) {
     console.warn(`DEAL_ENTRY_OUT: order bulunamadı (positionId=${deal.positionId})`);
     return;
   }
   if (order.status === 'CLOSED') return;
+
+  // Pozisyon bu deal'dan SONRA hala terminalState'de var mi -- varsa (kalan
+  // hacimle) bu KISMI bir kapanis, pozisyon devam ediyor. MT5'te "yarisinin
+  // karini al, yarisiyla devam et" senaryosu boyle bir DEAL_ENTRY_OUT uretir,
+  // ama pozisyon KAPANMAZ. Eskiden her DEAL_ENTRY_OUT'u kosulsuz "tamamen
+  // kapandi" sayiyorduk -- bu, sadece ILK kismi karin kaydedilip asil final
+  // kapanisin (order.status zaten 'CLOSED' oldugu icin yukaridaki guard'a
+  // takilip) tamamen ATLANMASINA yol aciyordu.
+  const stillOpen = connection.terminalState.positions.some(p => p.id === deal.positionId);
+
+  if (stillOpen) {
+    // KISMI kapanis -- orders tablosuna DOKUNMA, sadece olayi kaydet.
+    await insertOrderEvent(order.id, 'PARTIAL_CLOSE', {
+      price: deal.price,
+      profit: deal.profit ?? 0,
+      newValue: deal.volume,  // bu parcada kapatilan hacim
+      rawPayload: deal,
+    });
+    console.log(`↔ Kısmi kapanış: order=${order.id} pozisyon=${deal.positionId} hacim=${deal.volume} kar=${deal.profit}`);
+    return;
+  }
+
+  // GERCEK final kapanis -- bu order'a ait TUM kismi kapanislari + bu son
+  // deal'i toplayip, hacim-agirlikli ortalama fiyat ve toplam kar hesapla.
+  const { rows: partials } = await pool.query(
+    `SELECT price, profit, new_value AS volume FROM order_events
+       WHERE order_id = $1 AND event_type = 'PARTIAL_CLOSE'`,
+    [order.id]
+  );
+
+  let totalPnl = deal.profit ?? 0;
+  let weightedPriceSum = deal.price * deal.volume;
+  let totalVolume = deal.volume;
+  for (const p of partials) {
+    totalPnl += Number(p.profit ?? 0);
+    weightedPriceSum += Number(p.price) * Number(p.volume ?? 0);
+    totalVolume += Number(p.volume ?? 0);
+  }
+  const avgClosePrice = totalVolume > 0 ? weightedPriceSum / totalVolume : deal.price;
+
   const { exitReason, isManual } = classifyClose(deal, order);
   await pool.query(
     `UPDATE orders
        SET status='CLOSED', close_price=$1, realized_pnl=$2, closed_at=$3,
            exit_reason=$4, is_manual=$5, updated_at=now()
      WHERE id=$6`,
-    [deal.price, deal.profit ?? 0, deal.time, exitReason, isManual, order.id]
+    [avgClosePrice, totalPnl, deal.time, exitReason, isManual, order.id]
   );
   await insertOrderEvent(order.id, 'CLOSED', {
     isManual,
-    price: deal.price,
-    profit: deal.profit ?? 0,
+    price: avgClosePrice,
+    profit: totalPnl,
     rawPayload: deal,
   });
   if (order.strategy_label !== 'MANUAL') {
     await notifyMake('CLOSED', order, {
-      close_price: deal.price,
-      profit: deal.profit ?? 0,
+      close_price: avgClosePrice,
+      profit: totalPnl,
       exit_reason: exitReason,
       is_manual: isManual,
     });
