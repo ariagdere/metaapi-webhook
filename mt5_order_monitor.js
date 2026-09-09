@@ -17,7 +17,7 @@ const STRATEGY_MAP = {
   6310570: 'V6 70+',
   68040: 'V6 80+ 40-',
   65050: 'V6 50- 50+',
-  7575: 'NAIF + ZLEMA',
+  7575: 'NAIF + ZLEME',
 };
 function resolveStrategyLabel(magic) {
   return STRATEGY_MAP[Number(magic)] || null;
@@ -72,7 +72,7 @@ async function insertOrderEvent(orderId, eventType, opts = {}) {
   await pool.query(
     `INSERT INTO order_events
        (order_id, event_type, is_manual, old_value, new_value, price, profit, source, raw_payload, event_time)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, $10)`,
     [
       orderId,
       eventType,
@@ -83,6 +83,7 @@ async function insertOrderEvent(orderId, eventType, opts = {}) {
       opts.profit ?? null,
       opts.source ?? 'streaming',
       opts.rawPayload ? JSON.stringify(opts.rawPayload) : null,
+      opts.eventTime ?? new Date(), // deal.time varsa GERCEK islem anini kullan, yoksa simdi
     ]
   );
 }
@@ -205,7 +206,7 @@ async function handleDealIn(deal, connection) {
        WHERE id=$4`,
       [deal.positionId, deal.price, deal.time, existing.id]
     );
-    await insertOrderEvent(existing.id, 'OPENED', { price: deal.price, rawPayload: deal });
+    await insertOrderEvent(existing.id, 'OPENED', { price: deal.price, rawPayload: deal, eventTime: deal.time });
     if (existing.strategy_label !== 'MANUAL') {
       await notifyMake('OPENED', existing, {
         fill_price: deal.price,
@@ -238,8 +239,8 @@ async function handleDealIn(deal, connection) {
     status: 'OPEN',
     openedAt: deal.time,
   });
-  await insertOrderEvent(id, 'CREATED', { source: 'streaming', rawPayload: deal });
-  await insertOrderEvent(id, 'OPENED', { price: deal.price, source: 'streaming', rawPayload: deal });
+  await insertOrderEvent(id, 'CREATED', { source: 'streaming', rawPayload: deal, eventTime: deal.time });
+  await insertOrderEvent(id, 'OPENED', { price: deal.price, source: 'streaming', rawPayload: deal, eventTime: deal.time });
   if (isSystem) {
     const order = await getOrderByMt5Id(deal.orderId);
     if (order) {
@@ -255,38 +256,48 @@ async function handleDealOut(deal, connection) {
   }
   if (order.status === 'CLOSED') return;
 
-  // Pozisyon bu deal'dan SONRA hala terminalState'de var mi -- varsa (kalan
-  // hacimle) bu KISMI bir kapanis, pozisyon devam ediyor. MT5'te "yarisinin
-  // karini al, yarisiyla devam et" senaryosu boyle bir DEAL_ENTRY_OUT uretir,
-  // ama pozisyon KAPANMAZ. Eskiden her DEAL_ENTRY_OUT'u kosulsuz "tamamen
-  // kapandi" sayiyorduk -- bu, sadece ILK kismi karin kaydedilip asil final
-  // kapanisin (order.status zaten 'CLOSED' oldugu icin yukaridaki guard'a
-  // takilip) tamamen ATLANMASINA yol aciyordu.
-  const stillOpen = connection.terminalState.positions.some(p => p.id === deal.positionId);
+  // Bu order icin simdiye kadar KAYDEDILMIS tum kismi kapanislari cek --
+  // hem "bu deal FINAL mi" sorusunu cevaplamak, hem (final ise) hacim-
+  // agirlikli ortalama fiyat/kar hesabinda kullanmak icin.
+  const { rows: partials } = await pool.query(
+    `SELECT price, profit, new_value AS volume FROM order_events
+       WHERE order_id = $1 AND event_type = 'PARTIAL_CLOSE'`,
+    [order.id]
+  );
+  const previouslyClosedVolume = partials.reduce((sum, p) => sum + Number(p.volume ?? 0), 0);
+  const dealVolume = Number(deal.volume ?? 0);
+  const originalVolume = Number(order.volume);
+  const VOLUME_EPS = 0.001; // lot hassasiyeti icin tolerans
 
-  if (stillOpen) {
+  // ONEMLI: "bu deal kismi mi final mi" sorusunu connection.terminalState'in
+  // O ANKI durumuna bakarak DEGIL, SADECE veritabanindaki gecmis kayitlara
+  // ve bu deal'in KENDI hacmine bakarak cevapliyoruz. Streaming baglantisi
+  // kopup yeniden baglanirsa, MetaAPI gecikmeli/backlog deal'leri GERIYE
+  // DONUK teslim edebilir -- o an terminalState ZATEN pozisyonun SONRAKI
+  // (belki tamamen kapanmis) halini gosteriyor olabilir, bu da ESKI
+  // (aslinda kismi olan) bir deal'i YANLISLIKLA "final" sandirir. Hacim
+  // toplami, ISLEME SIRASINDAN VE terminalState'in ANLIK durumundan
+  // TAMAMEN BAGIMSIZ, deterministik bir sinyal.
+  const isFinalClose = (previouslyClosedVolume + dealVolume) >= (originalVolume - VOLUME_EPS);
+
+  if (!isFinalClose) {
     // KISMI kapanis -- orders tablosuna DOKUNMA, sadece olayi kaydet.
     await insertOrderEvent(order.id, 'PARTIAL_CLOSE', {
       price: deal.price,
       profit: deal.profit ?? 0,
       newValue: deal.volume,  // bu parcada kapatilan hacim
       rawPayload: deal,
+      eventTime: deal.time,
     });
-    console.log(`↔ Kısmi kapanış: order=${order.id} pozisyon=${deal.positionId} hacim=${deal.volume} kar=${deal.profit}`);
+    console.log(`↔ Kısmi kapanış: order=${order.id} pozisyon=${deal.positionId} hacim=${deal.volume} kar=${deal.profit} (toplam kapanan=${(previouslyClosedVolume + dealVolume).toFixed(4)}/${originalVolume})`);
     return;
   }
 
   // GERCEK final kapanis -- bu order'a ait TUM kismi kapanislari + bu son
   // deal'i toplayip, hacim-agirlikli ortalama fiyat ve toplam kar hesapla.
-  const { rows: partials } = await pool.query(
-    `SELECT price, profit, new_value AS volume FROM order_events
-       WHERE order_id = $1 AND event_type = 'PARTIAL_CLOSE'`,
-    [order.id]
-  );
-
   let totalPnl = deal.profit ?? 0;
-  let weightedPriceSum = deal.price * deal.volume;
-  let totalVolume = deal.volume;
+  let weightedPriceSum = deal.price * dealVolume;
+  let totalVolume = dealVolume;
   for (const p of partials) {
     totalPnl += Number(p.profit ?? 0);
     weightedPriceSum += Number(p.price) * Number(p.volume ?? 0);
@@ -295,18 +306,26 @@ async function handleDealOut(deal, connection) {
   const avgClosePrice = totalVolume > 0 ? weightedPriceSum / totalVolume : deal.price;
 
   const { exitReason, isManual } = classifyClose(deal, order);
-  await pool.query(
+  // Atomik guard: WHERE status != 'CLOSED' ile, ayni order icin PARALEL
+  // calisan iki final-kapanis islemenin (teorik olarak) ikisinin de
+  // guncelleme yapmasini engeller -- sadece ilki basarili olur.
+  const { rowCount } = await pool.query(
     `UPDATE orders
        SET status='CLOSED', close_price=$1, realized_pnl=$2, closed_at=$3,
            exit_reason=$4, is_manual=$5, updated_at=now()
-     WHERE id=$6`,
+     WHERE id=$6 AND status != 'CLOSED'`,
     [avgClosePrice, totalPnl, deal.time, exitReason, isManual, order.id]
   );
+  if (rowCount === 0) {
+    console.warn(`handleDealOut: order=${order.id} zaten kapanmis (yaris durumu engellendi)`);
+    return;
+  }
   await insertOrderEvent(order.id, 'CLOSED', {
     isManual,
     price: avgClosePrice,
     profit: totalPnl,
     rawPayload: deal,
+    eventTime: deal.time,
   });
   if (order.strategy_label !== 'MANUAL') {
     await notifyMake('CLOSED', order, {
@@ -344,7 +363,7 @@ async function pollOrders(connection) {
         const { analysisId, apifyRunId } = parseCommentField(o.comment ?? o.brokerComment);
         const strategyLabel = resolveStrategyLabel(o.magic);
         const isSystem = analysisId != null || apifyRunId != null || strategyLabel != null;
-        const direction = o.type?.includes('SELL') ? 'SELL' : 'BUY';
+        const direction = o.type?.includes('SELL') ? 'SELL' : 'BUY'
         const id = await insertOrder({
           analysisId: isSystem ? analysisId : null,
           apifyRunId: isSystem ? apifyRunId : null,
