@@ -180,11 +180,19 @@ async function start() {
   const listener = createSafeListener({
     async onDealAdded(instanceIndex, deal) {
       if (seenDeals.has(deal.id)) return;
-      seenDeals.add(deal.id);
-      if (deal.entryType === 'DEAL_ENTRY_IN') {
-        await handleDealIn(deal, connection);
-      } else if (deal.entryType === 'DEAL_ENTRY_OUT') {
-        await handleDealOut(deal, connection);
+      try {
+        if (deal.entryType === 'DEAL_ENTRY_IN') {
+          await handleDealIn(deal, connection);
+        } else if (deal.entryType === 'DEAL_ENTRY_OUT') {
+          await handleDealOut(deal, connection);
+        }
+        // SADECE basariyla islendiyse "gorulmus" sayilir -- hata olursa
+        // (bu VARCHAR hatasi gibi, ya da herhangi baska GECICI bir sorun)
+        // seenDeals'a HIC eklenmez, boylece MetaAPI ayni deal'i tekrar
+        // gonderirse (resync sirasinda oldugu gibi) yeniden denenir.
+        seenDeals.add(deal.id)
+      } catch (err) {
+        console.error(`onDealAdded islenirken hata (deal.id=${deal.id}, positionId=${deal.positionId}):`, err.message)
       }
     }
   });
