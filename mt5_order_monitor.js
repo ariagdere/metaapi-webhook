@@ -23,6 +23,54 @@ const STRATEGY_MAP = {
 function resolveStrategyLabel(magic) {
   return STRATEGY_MAP[Number(magic)] || null;
 }
+// Dashboard'un /live emir panelinden acilan emirler. hakari-dashboard lib/panelOrder.ts ile
+// AYNI kurallar -- birinde degisirse digerinde de degismeli.
+//   magic 9100, clientId "HK_<10 karakter a-z0-9>_1". MetaApi SL/TP ile kapanan islemlerde
+//   clientId'nin son parcasini degistirebildigi icin eslestirme ilk iki parca uzerinden.
+const PANEL_MAGIC = 9100;
+function isPanelMagic(magic) {
+  return Number(magic) === PANEL_MAGIC;
+}
+function panelClientKey(clientId) {
+  if (typeof clientId !== 'string' || !clientId.startsWith('HK_')) return null;
+  const parts = clientId.split('_');
+  if (parts.length < 2 || !/^[a-z0-9]{10}$/.test(parts[1])) return null;
+  return `${parts[0]}_${parts[1]}`;
+}
+// Panel emrinin strateji etiketi: dashboard emri gondermeden ONCE order_intents'e yazar.
+// Bu servis tabloyu SADECE okur. Tablo yoksa / eslesme yoksa null -- order yine kaydedilir.
+async function getPanelIntent(clientId) {
+  const key = panelClientKey(clientId);
+  if (!key) return null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, strategy_label FROM order_intents WHERE client_key = $1`,
+      [key]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    console.error(`getPanelIntent hatası (clientId=${clientId}):`, err.message);
+    return null;
+  }
+}
+// Deal/emrin kaynagi. Panel emrinde etiket order_intents'ten gelir ve analiz/apify bagi yoktur:
+// MetaApi clientId'yi MT5'in comment alaninda sakladigi icin comment OKUNMAZ (yoksa
+// apify_run_id'ye clientId yazilirdi). Diger emirlerde eski kurallar (comment + magic).
+// hakari-dashboard lib/reconcileHelpers.ts resolveDealOrigin ile AYNI.
+async function resolveOrigin(item) {
+  const panelIntent = await getPanelIntent(item.clientId);
+  const isPanel = panelIntent != null || panelClientKey(item.clientId) != null || isPanelMagic(item.magic);
+  const { analysisId, apifyRunId } = isPanel
+    ? { analysisId: null, apifyRunId: null }
+    : parseCommentField(item.comment ?? item.brokerComment);
+  const strategyLabel = (panelIntent && panelIntent.strategy_label) || resolveStrategyLabel(item.magic);
+  const isSystem = analysisId != null || apifyRunId != null || strategyLabel != null;
+  return { isPanel, analysisId, apifyRunId, strategyLabel, isSystem };
+}
+function positiveOrNull(x) {
+  const n = Number(x);
+  return x != null && Number.isFinite(n) && n > 0 ? n : null;
+}
 // Comment iki şekilde gelebilir:
 //  - Düz sayı  -> mevcut stratejiler, analysis_id order açılırken zaten biliniyor
 //  - Diğer string -> Naif Aligned gibi hızlı yol stratejileri, apify_run_id
@@ -259,7 +307,7 @@ async function handleDealIn(deal, connection) {
       [deal.positionId, deal.price, deal.time, existing.id]
     );
     await insertOrderEvent(existing.id, 'OPENED', { price: deal.price, rawPayload: deal, eventTime: deal.time });
-    if (existing.strategy_label !== 'MANUAL') {
+    if (existing.strategy_label !== 'MANUAL' && !isPanelMagic(existing.magic)) {
       await notifyMake('OPENED', existing, {
         fill_price: deal.price,
         sl: existing.sl,
@@ -270,9 +318,7 @@ async function handleDealIn(deal, connection) {
     return;
   }
   const position = connection.terminalState.positions.find(p => p.id === deal.positionId);
-  const { analysisId, apifyRunId } = parseCommentField(deal.comment ?? deal.brokerComment);
-  const strategyLabel = resolveStrategyLabel(deal.magic);
-  const isSystem = analysisId != null || apifyRunId != null || strategyLabel != null;
+  const { isPanel, analysisId, apifyRunId, strategyLabel, isSystem } = await resolveOrigin(deal);
   const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
   const id = await insertOrder({
     analysisId: isSystem ? analysisId : null,
@@ -286,14 +332,20 @@ async function handleDealIn(deal, connection) {
     volume: deal.volume,
     entryPrice: deal.price,
     fillPrice: deal.price,
-    sl: position?.stopLoss ?? null,
-    tp: position?.takeProfit ?? null,
+    // Pozisyon terminalState'teyse onun guncel SL/TP'si (eski davranis); pozisyon henuz dusmediyse
+    // acilis deal'inin tasidigi emir SL/TP'si. Ikisi de yoksa panel emrinde pollPositions tamamlar.
+    sl: position ? positiveOrNull(position.stopLoss) : positiveOrNull(deal.stopLoss),
+    tp: position ? positiveOrNull(position.takeProfit) : positiveOrNull(deal.takeProfit),
     status: 'OPEN',
     openedAt: deal.time,
   });
   await insertOrderEvent(id, 'CREATED', { source: 'streaming', rawPayload: deal, eventTime: deal.time });
   await insertOrderEvent(id, 'OPENED', { price: deal.price, source: 'streaming', rawPayload: deal, eventTime: deal.time });
-  if (isSystem) {
+  if (isPanel) {
+    console.log(`🖱 Panel emri: order=${id} pozisyon=${deal.positionId} etiket=${strategyLabel ?? 'MANUAL'} clientId=${deal.clientId ?? '-'}`);
+  }
+  // Panel emirleri Make'e bildirilmez (analiz/apify bagi yok).
+  if (isSystem && !isPanel) {
     const order = await getOrderByMt5Id(deal.orderId);
     if (order) {
       await notifyMake('OPENED', order, { fill_price: deal.price, sl: order.sl, tp: order.tp, volume: order.volume });
@@ -379,7 +431,7 @@ async function handleDealOut(deal, connection) {
     rawPayload: deal,
     eventTime: deal.time,
   });
-  if (order.strategy_label !== 'MANUAL') {
+  if (order.strategy_label !== 'MANUAL' && !isPanelMagic(order.magic)) {
     await notifyMake('CLOSED', order, {
       close_price: avgClosePrice,
       profit: totalPnl,
@@ -412,9 +464,7 @@ async function pollOrders(connection) {
     if (!prev) {
       const existing = await getOrderByMt5Id(o.id);
       if (!existing) {
-        const { analysisId, apifyRunId } = parseCommentField(o.comment ?? o.brokerComment);
-        const strategyLabel = resolveStrategyLabel(o.magic);
-        const isSystem = analysisId != null || apifyRunId != null || strategyLabel != null;
+        const { analysisId, apifyRunId, strategyLabel, isSystem } = await resolveOrigin(o);
         const direction = o.type?.includes('SELL') ? 'SELL' : 'BUY'
         const id = await insertOrder({
           analysisId: isSystem ? analysisId : null,
@@ -487,10 +537,41 @@ async function pollOrders(connection) {
   }
 }
 // -------------------- POLLING: POSITIONS --------------------
+// Panel pozisyonu ILK kez goruldugunde: order SL/TP'siz kaydedildiyse (deal islenirken pozisyon
+// henuz terminalState'te yoktu ve deal SL/TP tasimiyordu) pozisyondaki degerlerle tamamlanir.
+// Yalnizca BOS alanlar doldurulur (dolu alan dropdown'la duzeltilmis olabilir) ve degisiklik
+// sayilmaz -- MODIFIED olayi yazilmaz. Diger stratejilerin davranisi degismez.
+async function fillMissingSlTp(p) {
+  if (!isPanelMagic(p.magic)) return;
+  const posSl = positiveOrNull(p.stopLoss);
+  const posTp = positiveOrNull(p.takeProfit);
+  if (posSl == null && posTp == null) return;
+  try {
+    const existing = await getOrderByPositionId(p.id);
+    if (!existing || existing.status !== 'OPEN') return;
+    if (existing.sl != null && existing.tp != null) return;
+    const sl = existing.sl != null ? Number(existing.sl) : posSl;
+    const tp = existing.tp != null ? Number(existing.tp) : posTp;
+    const entry = Number(existing.fill_price ?? existing.entry_price);
+    const { rTarget, rRisk } = await calculateRTargetRisk(existing.analysis_id, entry, sl, tp);
+    // COALESCE: okuma ile yazma arasinda elle girilen deger ezilmesin
+    const { rowCount } = await pool.query(
+      `UPDATE orders SET sl=COALESCE(sl, $1), tp=COALESCE(tp, $2), rr=$3, r_target=$4, r_risk=$5, updated_at=now()
+        WHERE id=$6 AND (sl IS NULL OR tp IS NULL)`,
+      [sl, tp, calculateRR(entry, sl, tp), rTarget, rRisk, existing.id]
+    );
+    if (rowCount > 0) console.log(`✎ SL/TP tamamlandı: order=${existing.id} pozisyon=${p.id} SL=${sl} TP=${tp}`);
+  } catch (err) {
+    console.error(`fillMissingSlTp hatası (pozisyon=${p.id}):`, err.message);
+  }
+}
 async function pollPositions(connection) {
   const positions = connection.terminalState.positions;
   for (const p of positions) {
     const prev = prevPositions.get(p.id);
+    if (!prev) {
+      await fillMissingSlTp(p);
+    }
     if (prev && (prev.stopLoss !== p.stopLoss || prev.takeProfit !== p.takeProfit)) {
       const existing = await getOrderByPositionId(p.id);
       if (existing) {
