@@ -333,7 +333,7 @@ async function handleDealIn(deal, connection) {
     entryPrice: deal.price,
     fillPrice: deal.price,
     // Pozisyon terminalState'teyse onun guncel SL/TP'si (eski davranis); pozisyon henuz dusmediyse
-    // acilis deal'inin tasidigi emir SL/TP'si. Ikisi de yoksa panel emrinde pollPositions tamamlar.
+    // acilis deal'inin tasidigi emir SL/TP'si. Ikisi de yoksa pollPositions (fillMissingSlTp) tamamlar.
     sl: position ? positiveOrNull(position.stopLoss) : positiveOrNull(deal.stopLoss),
     tp: position ? positiveOrNull(position.takeProfit) : positiveOrNull(deal.takeProfit),
     status: 'OPEN',
@@ -537,12 +537,16 @@ async function pollOrders(connection) {
   }
 }
 // -------------------- POLLING: POSITIONS --------------------
-// Panel pozisyonu ILK kez goruldugunde: order SL/TP'siz kaydedildiyse (deal islenirken pozisyon
-// henuz terminalState'te yoktu ve deal SL/TP tasimiyordu) pozisyondaki degerlerle tamamlanir.
+// Pozisyon ILK kez goruldugunde (panel, strateji ya da elle acilmis -- hepsi): order SL/TP'siz
+// kaydedildiyse pozisyondaki degerlerle tamamlanir. pollPositions SL/TP degisikligini onceki halle
+// kiyaslayarak yakalar; ilk goruste kiyaslanacak onceki hal yoktur. Bu yuzden SL/TP o ana kadar
+// girilmisse burasi yakalar:
+//   - deal islenirken pozisyon henuz terminalState'te yoktu / SL-TP'siz idi ve SL/TP hemen ardindan
+//     eklendi (orn. MT5'ten elle acilan islemler)
+//   - monitor yeniden baslarken acik olan pozisyonlar (kapaliyken girilen SL/TP)
 // Yalnizca BOS alanlar doldurulur (dolu alan dropdown'la duzeltilmis olabilir) ve degisiklik
-// sayilmaz -- MODIFIED olayi yazilmaz. Diger stratejilerin davranisi degismez.
+// sayilmaz -- MODIFIED olayi yazilmaz, Make'e bildirilmez.
 async function fillMissingSlTp(p) {
-  if (!isPanelMagic(p.magic)) return;
   const posSl = positiveOrNull(p.stopLoss);
   const posTp = positiveOrNull(p.takeProfit);
   if (posSl == null && posTp == null) return;
