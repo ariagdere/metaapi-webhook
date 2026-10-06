@@ -117,8 +117,8 @@ async function getOrderByPositionId(positionId) {
   );
   return rows[0] || null;
 }
-async function insertOrderEvent(orderId, eventType, opts = {}) {
-  await pool.query(
+async function insertOrderEvent(orderId, eventType, opts = {}, db = pool) {
+  await db.query(
     `INSERT INTO order_events
        (order_id, event_type, is_manual, old_value, new_value, price, profit, source, raw_payload, event_time)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, $10)`,
@@ -275,7 +275,7 @@ async function start() {
       try {
         if (deal.entryType === 'DEAL_ENTRY_IN') {
           await handleDealIn(deal, connection);
-        } else if (deal.entryType === 'DEAL_ENTRY_OUT') {
+        } else if (deal.entryType === 'DEAL_ENTRY_OUT' || deal.entryType === 'DEAL_ENTRY_OUT_BY') {
           await handleDealOut(deal, connection);
         }
         // SADECE basariyla islendiyse "gorulmus" sayilir -- hata olursa
@@ -294,6 +294,7 @@ async function start() {
   setInterval(() => pollOrders(connection), 1500);
   setInterval(() => pollPositions(connection), 1500);
   setInterval(() => expireOldPendingOrders(connection), 5 * 60 * 1000);
+  setInterval(() => sweepOpenOrders(connection), SWEEP_MS);
 }
 // -------------------- DEAL HANDLERS --------------------
 async function handleDealIn(deal, connection) {
@@ -352,6 +353,152 @@ async function handleDealIn(deal, connection) {
     }
   }
 }
+// -------------------- KAPANIS: KISMI / TAM --------------------
+// "Pozisyon tamamen kapandi mi?" sorusunun cevabi MT5'in KENDI deal gecmisinden gelir (MetaApi
+// REST, pozisyona gore): kapanis deal'lerinin hacmi acilis hacmine ulastiysa kapanmistir.
+// Eskiden bu karar yalnizca DB'ye yazilan PARTIAL_CLOSE kayitlarinin toplamiyla veriliyordu; bir
+// kismi kapanis kaydi eksik kalinca (monitor kapali / baglanti koptu / yazarken hata) order hic
+// kapanmiyor, ayni deal tekrar gelince (deploy sonrasi gecmis yeniden gelir) erken kapaniyordu.
+// Simdi: MT5 gecmisi + DB'ye yazilmis kismi kapanislar + islenen deal, deal id'ye gore tekil
+// birlestirilir. Her kaynak MT5'teki gercek deal'lerin bir alt kumesi oldugu icin birlesim cift
+// saymaz; REST gecmisi eksik donse bile (gecikme / yukleniyor) DB'deki parcalar kaybolmaz.
+// REST'e ulasilamazsa yalnizca DB kayitlari + islenen deal (order.volume'a karsi) kullanilir.
+const VOLUME_EPS = 0.001; // lot hassasiyeti icin tolerans
+const CLOSING_ENTRY_TYPES = new Set(['DEAL_ENTRY_OUT', 'DEAL_ENTRY_OUT_BY']);
+const clientApiUrl = (process.env.METAAPI_CLIENT_API_URL || 'https://mt-client-api-v1.london.agiliumtrade.ai').replace(/\/+$/, '');
+const REST_TIMEOUT_MS = 5_000; // REST cagrisi SDK'nin olay kuyrugunda calisiyor: uzun beklemesin
+const REST_BACKOFF_MS = Number(process.env.METAAPI_REST_BACKOFF_MS ?? 60_000); // hatadan sonra bu sure REST denenmez
+const GONE_RECHECK_MS = [10_000, 60_000, 5 * 60_000]; // pozisyon kayboldu ama gecmis henuz kapanisi gostermiyorsa
+const SWEEP_MS = Number(process.env.OPEN_ORDER_SWEEP_MS) || 5 * 60_000; // DB'de acik / MT5'te yok taramasi
+const SWEEP_MAX = 20; // bir taramada en fazla bu kadar pozisyonun gecmisine bakilir (MetaApi kredisi)
+let restDownUntil = 0;
+
+const timeMs = (t) => new Date(t).getTime();
+const sumVolume = (deals) => deals.reduce((sum, d) => sum + Number(d.volume ?? 0), 0);
+
+// Pozisyonun MT5'teki tum deal'leri. Hata olursa throw eder ve REST_BACKOFF_MS boyunca REST'i atlatir.
+async function fetchPositionDeals(positionId) {
+  if (Date.now() < restDownUntil) throw new Error('MetaApi REST az önce hata verdi, geçici olarak atlanıyor');
+  try {
+    const res = await fetch(
+      `${clientApiUrl}/users/current/accounts/${accountId}/history-deals/position/${encodeURIComponent(positionId)}`,
+      { headers: { 'auth-token': token, Accept: 'application/json' }, signal: AbortSignal.timeout(REST_TIMEOUT_MS) }
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const deals = await res.json();
+    if (!Array.isArray(deals)) throw new Error('beklenmeyen yanıt');
+    return deals;
+  } catch (err) {
+    restDownUntil = Date.now() + REST_BACKOFF_MS;
+    throw err;
+  }
+}
+
+// Deal listesinden kapanis durumu (deal id'ye gore tekil; ayni id'de sonraki kaynak oncekini ezer).
+// extraDeal: henuz gecmise dusmemis olabilecek, su an islenen deal. Acilis deal'i yoksa acilis hacmi
+// olarak order.volume kullanilir.
+function closeStateFromDeals(deals, extraDeal, fallbackOpenVolume, source) {
+  const byId = new Map();
+  for (const d of deals) if (d && d.id != null) byId.set(String(d.id), d);
+  if (extraDeal && extraDeal.id != null) byId.set(String(extraDeal.id), extraDeal);
+  const all = [...byId.values()];
+  const outs = all.filter((d) => CLOSING_ENTRY_TYPES.has(d.entryType)).sort((a, b) => timeMs(a.time) - timeMs(b.time));
+  const inVolume = sumVolume(all.filter((d) => d.entryType === 'DEAL_ENTRY_IN'));
+  const openVolume = inVolume > 0 ? inVolume : fallbackOpenVolume;
+  const closedVolume = sumVolume(outs);
+  return { outs, openVolume, closedVolume, closed: outs.length > 0 && closedVolume >= openVolume - VOLUME_EPS, source };
+}
+
+// DB'deki PARTIAL_CLOSE kayitlari, deal olarak. id: kaydin raw_payload'indaki deal id'si (yoksa sentetik).
+async function recordedPartials(order) {
+  const { rows } = await pool.query(
+    `SELECT price, profit, new_value AS volume, event_time, raw_payload FROM order_events
+      WHERE order_id = $1 AND event_type = 'PARTIAL_CLOSE' ORDER BY id`,
+    [order.id]
+  );
+  return rows.map((r, i) => {
+    const dealId = r.raw_payload?.id;
+    return {
+      id: dealId != null ? String(dealId) : `event-${i}`,
+      realId: dealId != null,
+      entryType: 'DEAL_ENTRY_OUT',
+      price: Number(r.price),
+      profit: Number(r.profit ?? 0),
+      volume: Number(r.volume ?? 0),
+      time: r.event_time,
+      reason: r.raw_payload?.reason,
+    };
+  });
+}
+
+// Pozisyonun kapanis durumu (bkz. yukaridaki aciklama). deal: su an islenen deal ya da null.
+async function mt5CloseState(order, deal) {
+  const recorded = await recordedPartials(order);
+  try {
+    const deals = await fetchPositionDeals(order.mt5_position_id);
+    // Kimligi olmayan (deal id'siz) eski kayitlar MT5 verisiyle eslestirilemez: REST varken sayilmaz.
+    return closeStateFromDeals([...recorded.filter((d) => d.realId), ...deals], deal, Number(order.volume), 'mt5');
+  } catch (err) {
+    console.warn(`MT5 deal geçmişi alınamadı (pozisyon=${order.mt5_position_id}): ${err.message} -- DB'deki kısmi kapanışlarla karar veriliyor`);
+    return closeStateFromDeals(recorded, deal, Number(order.volume), 'db');
+  }
+}
+
+// Order'i TUM kapanis deal'lerinden kapatir: hacim-agirlikli ortalama fiyat, toplam kar, son deal'in
+// zamani ve nedeni. Durum guncellemesi ve CLOSED olayi tek transaction'da; Make bildirimi commit'ten
+// sonra. Atomik guard (WHERE status != 'CLOSED'): ayni anda iki yol (deal / kaybolan pozisyon /
+// tarama) kapatmaya calisirsa yalnizca biri yazar. Kapattiysa true.
+async function finalizeClose(order, state) {
+  let totalPnl = 0, weightedPriceSum = 0, totalVolume = 0;
+  for (const d of state.outs) {
+    const v = Number(d.volume ?? 0);
+    totalPnl += Number(d.profit ?? 0);
+    weightedPriceSum += Number(d.price ?? 0) * v;
+    totalVolume += v;
+  }
+  const lastOut = state.outs[state.outs.length - 1];
+  const avgClosePrice = totalVolume > 0 ? weightedPriceSum / totalVolume : Number(lastOut.price);
+  const { exitReason, isManual } = classifyClose(lastOut, order);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rowCount } = await client.query(
+      `UPDATE orders
+         SET status='CLOSED', close_price=$1, realized_pnl=$2, closed_at=$3,
+             exit_reason=$4, is_manual=$5, updated_at=now()
+       WHERE id=$6 AND status != 'CLOSED'`,
+      [avgClosePrice, totalPnl, lastOut.time, exitReason, isManual, order.id]
+    );
+    if (rowCount === 0) {
+      await client.query('ROLLBACK');
+      return false;
+    }
+    await insertOrderEvent(order.id, 'CLOSED', {
+      isManual,
+      price: avgClosePrice,
+      profit: totalPnl,
+      rawPayload: lastOut,
+      eventTime: lastOut.time,
+    }, client);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+  console.log(`✔ Kapandı: order=${order.id} pozisyon=${order.mt5_position_id} parça=${state.outs.length} hacim=${totalVolume.toFixed(2)}/${state.openVolume} kar=${totalPnl.toFixed(2)} (${state.source})`);
+  if (order.strategy_label !== 'MANUAL' && !isPanelMagic(order.magic)) {
+    await notifyMake('CLOSED', order, {
+      close_price: avgClosePrice,
+      profit: totalPnl,
+      exit_reason: exitReason,
+      is_manual: isManual,
+    });
+  }
+  return true;
+}
+
 async function handleDealOut(deal, connection) {
   const order = await getOrderByPositionId(deal.positionId);
   if (!order) {
@@ -360,84 +507,113 @@ async function handleDealOut(deal, connection) {
   }
   if (order.status === 'CLOSED') return;
 
-  // Bu order icin simdiye kadar KAYDEDILMIS tum kismi kapanislari cek --
-  // hem "bu deal FINAL mi" sorusunu cevaplamak, hem (final ise) hacim-
-  // agirlikli ortalama fiyat/kar hesabinda kullanmak icin.
-  const { rows: partials } = await pool.query(
-    `SELECT price, profit, new_value AS volume FROM order_events
-       WHERE order_id = $1 AND event_type = 'PARTIAL_CLOSE'`,
-    [order.id]
-  );
-  const previouslyClosedVolume = partials.reduce((sum, p) => sum + Number(p.volume ?? 0), 0);
-  const dealVolume = Number(deal.volume ?? 0);
-  const originalVolume = Number(order.volume);
-  const VOLUME_EPS = 0.001; // lot hassasiyeti icin tolerans
-
-  // ONEMLI: "bu deal kismi mi final mi" sorusunu connection.terminalState'in
-  // O ANKI durumuna bakarak DEGIL, SADECE veritabanindaki gecmis kayitlara
-  // ve bu deal'in KENDI hacmine bakarak cevapliyoruz. Streaming baglantisi
-  // kopup yeniden baglanirsa, MetaAPI gecikmeli/backlog deal'leri GERIYE
-  // DONUK teslim edebilir -- o an terminalState ZATEN pozisyonun SONRAKI
-  // (belki tamamen kapanmis) halini gosteriyor olabilir, bu da ESKI
-  // (aslinda kismi olan) bir deal'i YANLISLIKLA "final" sandirir. Hacim
-  // toplami, ISLEME SIRASINDAN VE terminalState'in ANLIK durumundan
-  // TAMAMEN BAGIMSIZ, deterministik bir sinyal.
-  const isFinalClose = (previouslyClosedVolume + dealVolume) >= (originalVolume - VOLUME_EPS);
-
-  if (!isFinalClose) {
-    // KISMI kapanis -- orders tablosuna DOKUNMA, sadece olayi kaydet.
-    await insertOrderEvent(order.id, 'PARTIAL_CLOSE', {
-      price: deal.price,
-      profit: deal.profit ?? 0,
-      newValue: deal.volume,  // bu parcada kapatilan hacim
-      rawPayload: deal,
-      eventTime: deal.time,
-    });
-    console.log(`↔ Kısmi kapanış: order=${order.id} pozisyon=${deal.positionId} hacim=${deal.volume} kar=${deal.profit} (toplam kapanan=${(previouslyClosedVolume + dealVolume).toFixed(4)}/${originalVolume})`);
+  const state = await mt5CloseState(order, deal);
+  if (state.closed) {
+    await finalizeClose(order, state); // false: diger yol az once kapatti
     return;
   }
 
-  // GERCEK final kapanis -- bu order'a ait TUM kismi kapanislari + bu son
-  // deal'i toplayip, hacim-agirlikli ortalama fiyat ve toplam kar hesapla.
-  let totalPnl = deal.profit ?? 0;
-  let weightedPriceSum = deal.price * dealVolume;
-  let totalVolume = dealVolume;
-  for (const p of partials) {
-    totalPnl += Number(p.profit ?? 0);
-    weightedPriceSum += Number(p.price) * Number(p.volume ?? 0);
-    totalVolume += Number(p.volume ?? 0);
-  }
-  const avgClosePrice = totalVolume > 0 ? weightedPriceSum / totalVolume : deal.price;
-
-  const { exitReason, isManual } = classifyClose(deal, order);
-  // Atomik guard: WHERE status != 'CLOSED' ile, ayni order icin PARALEL
-  // calisan iki final-kapanis islemenin (teorik olarak) ikisinin de
-  // guncelleme yapmasini engeller -- sadece ilki basarili olur.
-  const { rowCount } = await pool.query(
-    `UPDATE orders
-       SET status='CLOSED', close_price=$1, realized_pnl=$2, closed_at=$3,
-           exit_reason=$4, is_manual=$5, updated_at=now()
-     WHERE id=$6 AND status != 'CLOSED'`,
-    [avgClosePrice, totalPnl, deal.time, exitReason, isManual, order.id]
+  // KISMI kapanis -- orders tablosuna DOKUNMA, olayi BIR KEZ kaydet (ayni deal tekrar gelirse yazma).
+  const { rows: dup } = await pool.query(
+    `SELECT 1 FROM order_events WHERE order_id = $1 AND event_type = 'PARTIAL_CLOSE' AND raw_payload->>'id' = $2 LIMIT 1`,
+    [order.id, String(deal.id)]
   );
-  if (rowCount === 0) {
-    console.warn(`handleDealOut: order=${order.id} zaten kapanmis (yaris durumu engellendi)`);
-    return;
-  }
-  await insertOrderEvent(order.id, 'CLOSED', {
-    isManual,
-    price: avgClosePrice,
-    profit: totalPnl,
+  if (dup.length > 0) return;
+  await insertOrderEvent(order.id, 'PARTIAL_CLOSE', {
+    price: deal.price,
+    profit: deal.profit ?? 0,
+    newValue: deal.volume,  // bu parcada kapatilan hacim
     rawPayload: deal,
     eventTime: deal.time,
   });
-  if (order.strategy_label !== 'MANUAL' && !isPanelMagic(order.magic)) {
-    await notifyMake('CLOSED', order, {
-      close_price: avgClosePrice,
-      profit: totalPnl,
-      exit_reason: exitReason,
-      is_manual: isManual,
-    });
+  console.log(`↔ Kısmi kapanış: order=${order.id} pozisyon=${deal.positionId} hacim=${deal.volume} kar=${deal.profit} (kapanan=${state.closedVolume.toFixed(2)}/${state.openVolume}, ${state.source})`);
+}
+
+// Baglanti saglikli mi: yeniden baglanma / senkronizasyon sirasinda terminalState gecici olarak bos
+// ya da eksik olabilir; o sirada "pozisyon kayboldu" sonucu cikarilmaz.
+function connectionHealthy(connection) {
+  return connection.synchronized !== false && connection.terminalState.connectedToBroker !== false;
+}
+
+// Pozisyon MT5'teki acik pozisyonlardan kayboldu: kapanis deal'i gelmemis ya da islenememis olsa da
+// order'i MT5 gecmisinden kapatir. Gecmis henuz kapanisi gostermiyorsa birkac kez tekrar bakar.
+// Pozisyon basina tek zincir; pozisyon geri gelirse (yeniden baglanma) iptal edilir ve onceki SL/TP
+// durumu (prevPositions) korunur -- boylece aradaki SL/TP degisikligi MODIFIED olarak yakalanir.
+const goneChecks = new Map(); // positionId -> true (calisiyor) | bekleyen tekrar zamanlayicisi
+
+function startGoneCheck(positionId, connection) {
+  if (goneChecks.has(positionId)) return;
+  goneChecks.set(positionId, true);
+  void runGoneCheck(positionId, connection, 0);
+}
+
+function cancelGoneCheck(positionId) {
+  const handle = goneChecks.get(positionId);
+  if (handle === undefined) return;
+  if (handle !== true) clearTimeout(handle);
+  goneChecks.delete(positionId);
+}
+
+async function runGoneCheck(positionId, connection, attempt) {
+  if (!goneChecks.has(positionId)) return;
+  goneChecks.set(positionId, true);
+  let finished = false; // true: order kapandi ya da artik acik degil -- takip biter
+  try {
+    if (connection.terminalState.positions.some((p) => p.id === positionId)) {
+      cancelGoneCheck(positionId); // geri geldi
+      return;
+    }
+    const order = await getOrderByPositionId(positionId);
+    if (!order || order.status !== 'OPEN') {
+      finished = true;
+    } else {
+      const state = await mt5CloseState(order, null);
+      if (state.closed) {
+        if (await finalizeClose(order, state)) console.log(`🔎 Pozisyon MT5'te yok, kapanış geçmişten tamamlandı: order=${order.id}`);
+        finished = true;
+      }
+    }
+  } catch (err) {
+    console.error(`kapanış kontrolü hatası (pozisyon=${positionId}):`, err.message);
+  }
+  if (!goneChecks.has(positionId)) return; // bu sirada iptal edildi (pozisyon geri geldi)
+  if (!finished && attempt < GONE_RECHECK_MS.length) {
+    const handle = setTimeout(() => runGoneCheck(positionId, connection, attempt + 1), GONE_RECHECK_MS[attempt]);
+    handle.unref?.();
+    goneChecks.set(positionId, handle);
+    return;
+  }
+  if (!finished) {
+    console.warn(`⚠ Pozisyon ${positionId} MT5'te açık değil ama geçmişi tam kapanış göstermiyor; ${GONE_RECHECK_MS.length + 1} denemeden sonra bırakıldı (periyodik tarama ve mutabakat yeniden bakar)`);
+  }
+  goneChecks.delete(positionId);
+  prevPositions.delete(positionId);
+}
+
+// Periyodik guvenlik agi: DB'de ACIK olup MT5'te acik pozisyonu olmayan order'lar. Bu surec o
+// pozisyonu hic gormemis olabilir (monitor kapaliyken kapandi, kapanis deal'i hic gelmedi).
+// Karar yine MT5 gecmisinden; tek turda en fazla SWEEP_MAX pozisyon.
+let sweepRunning = false;
+async function sweepOpenOrders(connection) {
+  if (sweepRunning || !connectionHealthy(connection)) return;
+  sweepRunning = true;
+  try {
+    const openIds = new Set(connection.terminalState.positions.map((p) => String(p.id)));
+    const { rows } = await pool.query(`SELECT * FROM orders WHERE status = 'OPEN' AND mt5_position_id IS NOT NULL ORDER BY id`);
+    let checked = 0;
+    for (const order of rows) {
+      const positionId = String(order.mt5_position_id);
+      if (openIds.has(positionId) || goneChecks.has(positionId)) continue;
+      if (++checked > SWEEP_MAX) break;
+      const state = await mt5CloseState(order, null);
+      if (state.closed && (await finalizeClose(order, state))) {
+        console.log(`🧹 Tarama: MT5'te kapanmış order kapatıldı: order=${order.id} pozisyon=${positionId}`);
+      }
+    }
+  } catch (err) {
+    console.error('sweepOpenOrders hatası:', err.message);
+  } finally {
+    sweepRunning = false;
   }
 }
 function classifyClose(deal, order) {
@@ -569,32 +745,50 @@ async function fillMissingSlTp(p) {
     console.error(`fillMissingSlTp hatası (pozisyon=${p.id}):`, err.message);
   }
 }
+let pollPositionsRunning = false;
 async function pollPositions(connection) {
-  const positions = connection.terminalState.positions;
-  for (const p of positions) {
-    const prev = prevPositions.get(p.id);
-    if (!prev) {
-      await fillMissingSlTp(p);
-    }
-    if (prev && (prev.stopLoss !== p.stopLoss || prev.takeProfit !== p.takeProfit)) {
-      const existing = await getOrderByPositionId(p.id);
-      if (existing) {
-        const { rTarget, rRisk } = await calculateRTargetRisk(
-          existing.analysis_id, existing.fill_price, p.stopLoss, p.takeProfit
-        );
-        await pool.query(
-          `UPDATE orders SET sl=$1, tp=$2, rr=$3, r_target=$4, r_risk=$5, updated_at=now() WHERE id=$6`,
-          [p.stopLoss, p.takeProfit, calculateRR(existing.fill_price, p.stopLoss, p.takeProfit), rTarget, rRisk, existing.id]
-        );
-        if (prev.stopLoss !== p.stopLoss) {
-          await insertOrderEvent(existing.id, 'MODIFIED', { isManual: true, oldValue: prev.stopLoss, newValue: p.stopLoss, rawPayload: p });
-        }
-        if (prev.takeProfit !== p.takeProfit) {
-          await insertOrderEvent(existing.id, 'MODIFIED', { isManual: true, oldValue: prev.takeProfit, newValue: p.takeProfit, rawPayload: p });
+  if (pollPositionsRunning) return; // onceki tur (DB yazimlari) bitmeden yenisi baslamasin
+  pollPositionsRunning = true;
+  try {
+    const positions = connection.terminalState.positions;
+    for (const p of positions) {
+      cancelGoneCheck(p.id); // (yeniden) gorundu
+      const prev = prevPositions.get(p.id);
+      if (!prev) {
+        await fillMissingSlTp(p);
+      }
+      if (prev && (prev.stopLoss !== p.stopLoss || prev.takeProfit !== p.takeProfit)) {
+        const existing = await getOrderByPositionId(p.id);
+        if (existing) {
+          const { rTarget, rRisk } = await calculateRTargetRisk(
+            existing.analysis_id, existing.fill_price, p.stopLoss, p.takeProfit
+          );
+          await pool.query(
+            `UPDATE orders SET sl=$1, tp=$2, rr=$3, r_target=$4, r_risk=$5, updated_at=now() WHERE id=$6`,
+            [p.stopLoss, p.takeProfit, calculateRR(existing.fill_price, p.stopLoss, p.takeProfit), rTarget, rRisk, existing.id]
+          );
+          if (prev.stopLoss !== p.stopLoss) {
+            await insertOrderEvent(existing.id, 'MODIFIED', { isManual: true, oldValue: prev.stopLoss, newValue: p.stopLoss, rawPayload: p });
+          }
+          if (prev.takeProfit !== p.takeProfit) {
+            await insertOrderEvent(existing.id, 'MODIFIED', { isManual: true, oldValue: prev.takeProfit, newValue: p.takeProfit, rawPayload: p });
+          }
         }
       }
+      prevPositions.set(p.id, { stopLoss: p.stopLoss, takeProfit: p.takeProfit });
     }
-    prevPositions.set(p.id, { stopLoss: p.stopLoss, takeProfit: p.takeProfit });
+    // Onceki turlarda gorulup artik olmayan pozisyonlar: kapanis deal'i gelmese de order kapansin.
+    // Baglanti saglikli degilse bekle (terminalState gecici bos olabilir).
+    if (connectionHealthy(connection)) {
+      const currentIds = new Set(positions.map((p) => p.id));
+      for (const id of prevPositions.keys()) {
+        if (!currentIds.has(id)) startGoneCheck(id, connection);
+      }
+    }
+  } catch (err) {
+    console.error('pollPositions hatası:', err.message);
+  } finally {
+    pollPositionsRunning = false;
   }
 }
 // -------------------- EXPIRY POLLER --------------------
