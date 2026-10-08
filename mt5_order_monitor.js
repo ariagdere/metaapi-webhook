@@ -198,12 +198,25 @@ async function computeLsrAngles(tMs) {
   return out;
 }
 
+// Acilarin hesaplandigi an: order'in MT5'te olustugu an (piyasa emrinde acilis deal'i, bekleyen
+// emirde emrin verildigi an). Canli akista Date.now() ile ayni; yeniden baslatma / baglanti kopmasi
+// sonrasi gecikmeli islenen order'da acinin isleme anina degil islem anina gore hesaplanmasini
+// saglar. Gecersiz ya da ileri bir zamansa simdi.
+// Istisna: monitor kapaliyken hem verilip hem dolan bekleyen emir burada yalnizca acilis deal'iyle
+// gorulur; emrin verildigi an deal'de olmadigi icin dolum ani kullanilir. (hakari-dashboard mutabakati
+// ayni durumda emrin verildigi ani MT5 emir gecmisinden alir.)
+function angleTimeMs(t) {
+  const now = Date.now();
+  const ms = t instanceof Date ? t.getTime() : (t != null ? new Date(t).getTime() : NaN);
+  return Number.isFinite(ms) && ms <= now ? ms : now;
+}
+
 // Insert a new order row (system or manual). Streaming tek yazma noktasi.
 async function insertOrder(data) {
   const { rTarget, rRisk } = await calculateRTargetRisk(
     data.analysisId ?? null, data.entryPrice, data.sl, data.tp
   );
-  const { h1LsAngle, m5LsAngle, h1TtPosAngle, m5TtPosAngle } = await computeLsrAngles(Date.now());
+  const { h1LsAngle, m5LsAngle, h1TtPosAngle, m5TtPosAngle } = await computeLsrAngles(angleTimeMs(data.angleTime));
   const { rows } = await pool.query(
     `INSERT INTO orders
        (analysis_id, apify_run_id, mt5_order_id, mt5_position_id, magic, strategy_label, symbol, direction,
@@ -339,6 +352,7 @@ async function handleDealIn(deal, connection) {
     tp: position ? positiveOrNull(position.takeProfit) : positiveOrNull(deal.takeProfit),
     status: 'OPEN',
     openedAt: deal.time,
+    angleTime: deal.time,
   });
   await insertOrderEvent(id, 'CREATED', { source: 'streaming', rawPayload: deal, eventTime: deal.time });
   await insertOrderEvent(id, 'OPENED', { price: deal.price, source: 'streaming', rawPayload: deal, eventTime: deal.time });
@@ -658,6 +672,7 @@ async function pollOrders(connection) {
           tp: o.takeProfit,
           status: 'PENDING',
           openedAt: null,
+          angleTime: o.time, // emrin verildigi an
         });
         await insertOrderEvent(id, 'CREATED', { source: 'streaming', rawPayload: o });
       }
