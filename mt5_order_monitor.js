@@ -19,6 +19,7 @@ const STRATEGY_MAP = {
   68040: 'V6 80+ 40-',
   65050: 'V6 50- 50+',
   7575: 'NAIF + ZLEMA',
+  15033: 'SDL_v3 - Manuel Zone No Cap',
 };
 function resolveStrategyLabel(magic) {
   return STRATEGY_MAP[Number(magic)] || null;
@@ -36,6 +37,14 @@ function panelClientKey(clientId) {
   const parts = clientId.split('_');
   if (parts.length < 2 || !/^[a-z0-9]{10}$/.test(parts[1])) return null;
   return `${parts[0]}_${parts[1]}`;
+}
+// Yeni sistemin (paraleltrading, SDL elle zonlar) emirleri: magic 15033, clientId "PT_<10 karakter a-z0-9>_1".
+// Etiket STRATEGY_MAP'ten. Panel emri gibi analiz/apify bagi yoktur: comment OKUNMAZ (clientId MT5'in comment
+// alaninda; okunsa apify_run_id'ye yazilirdi) ve Make'e bildirim gitmez. hakari-dashboard lib/reconcileHelpers.ts
+// ile AYNI -- birinde degisirse digerinde de degismeli.
+const PARALEL_MAGICS = new Set([15033]);
+function isParalelMagic(magic) {
+  return PARALEL_MAGICS.has(Number(magic));
 }
 // Panel emrinin strateji etiketi: dashboard emri gondermeden ONCE order_intents'e yazar.
 // Bu servis tabloyu SADECE okur. Tablo yoksa / eslesme yoksa null -- order yine kaydedilir.
@@ -60,12 +69,13 @@ async function getPanelIntent(clientId) {
 async function resolveOrigin(item) {
   const panelIntent = await getPanelIntent(item.clientId);
   const isPanel = panelIntent != null || panelClientKey(item.clientId) != null || isPanelMagic(item.magic);
-  const { analysisId, apifyRunId } = isPanel
+  const isParalel = !isPanel && isParalelMagic(item.magic);
+  const { analysisId, apifyRunId } = isPanel || isParalel
     ? { analysisId: null, apifyRunId: null }
     : parseCommentField(item.comment ?? item.brokerComment);
   const strategyLabel = (panelIntent && panelIntent.strategy_label) || resolveStrategyLabel(item.magic);
   const isSystem = analysisId != null || apifyRunId != null || strategyLabel != null;
-  return { isPanel, analysisId, apifyRunId, strategyLabel, isSystem };
+  return { isPanel, isParalel, analysisId, apifyRunId, strategyLabel, isSystem };
 }
 function positiveOrNull(x) {
   const n = Number(x);
@@ -321,7 +331,7 @@ async function handleDealIn(deal, connection) {
       [deal.positionId, deal.price, deal.time, existing.id]
     );
     await insertOrderEvent(existing.id, 'OPENED', { price: deal.price, rawPayload: deal, eventTime: deal.time });
-    if (existing.strategy_label !== 'MANUAL' && !isPanelMagic(existing.magic)) {
+    if (existing.strategy_label !== 'MANUAL' && !isPanelMagic(existing.magic) && !isParalelMagic(existing.magic)) {
       await notifyMake('OPENED', existing, {
         fill_price: deal.price,
         sl: existing.sl,
@@ -332,7 +342,7 @@ async function handleDealIn(deal, connection) {
     return;
   }
   const position = connection.terminalState.positions.find(p => p.id === deal.positionId);
-  const { isPanel, analysisId, apifyRunId, strategyLabel, isSystem } = await resolveOrigin(deal);
+  const { isPanel, isParalel, analysisId, apifyRunId, strategyLabel, isSystem } = await resolveOrigin(deal);
   const direction = deal.type === 'DEAL_TYPE_BUY' ? 'BUY' : 'SELL';
   const id = await insertOrder({
     analysisId: isSystem ? analysisId : null,
@@ -359,8 +369,8 @@ async function handleDealIn(deal, connection) {
   if (isPanel) {
     console.log(`🖱 Panel emri: order=${id} pozisyon=${deal.positionId} etiket=${strategyLabel ?? 'MANUAL'} clientId=${deal.clientId ?? '-'}`);
   }
-  // Panel emirleri Make'e bildirilmez (analiz/apify bagi yok).
-  if (isSystem && !isPanel) {
+  // Panel ve yeni sistemin emirleri Make'e bildirilmez (analiz/apify bagi yok).
+  if (isSystem && !isPanel && !isParalel) {
     const order = await getOrderByMt5Id(deal.orderId);
     if (order) {
       await notifyMake('OPENED', order, { fill_price: deal.price, sl: order.sl, tp: order.tp, volume: order.volume });
@@ -502,7 +512,7 @@ async function finalizeClose(order, state) {
     client.release();
   }
   console.log(`✔ Kapandı: order=${order.id} pozisyon=${order.mt5_position_id} parça=${state.outs.length} hacim=${totalVolume.toFixed(2)}/${state.openVolume} kar=${totalPnl.toFixed(2)} (${state.source})`);
-  if (order.strategy_label !== 'MANUAL' && !isPanelMagic(order.magic)) {
+  if (order.strategy_label !== 'MANUAL' && !isPanelMagic(order.magic) && !isParalelMagic(order.magic)) {
     await notifyMake('CLOSED', order, {
       close_price: avgClosePrice,
       profit: totalPnl,
